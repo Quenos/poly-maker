@@ -43,33 +43,78 @@ def get_all_positions(client):
         return pd.DataFrame()
     
 def combine_dfs(orders_df, positions, markets_df, selected_df):
+    """Join orders/positions with market metadata safely.
+
+    The previous implementation asserted that every merged row matched a market
+    token, which can fail when new markets appear or sheets are out of sync.
+    This version degrades gracefully and still returns a useful summary.
+    """
+    # Normalize id columns for join
+    if 'asset_id' not in orders_df.columns:
+        for cand in ['asset', 'token_id', 'tokenId']:
+            if cand in orders_df.columns:
+                orders_df = orders_df.rename(columns={cand: 'asset_id'})
+                break
+    pos_id_col = None
+    for cand in ['asset', 'asset_id', 'token', 'tokenId']:
+        if cand in positions.columns:
+            pos_id_col = cand
+            break
+    if pos_id_col and pos_id_col != 'asset':
+        positions = positions.rename(columns={pos_id_col: 'asset'})
+    elif not pos_id_col:
+        positions = positions.copy()
+        positions['asset'] = ''
+
     merged_df = orders_df.merge(positions, left_on=['asset_id'], right_on=['asset'], how='outer')
     merged_df['asset_id'] = merged_df['asset_id'].combine_first(merged_df['asset'])
-    merged_df = merged_df.drop(columns='asset', axis=1)
+    if 'asset' in merged_df.columns:
+        merged_df = merged_df.drop(columns='asset', axis=1)
 
+    # First attempt: strict join via token1/token2
     merge_token1 = merged_df.merge(markets_df, left_on='asset_id', right_on='token1', how='inner')
     merge_token1['merged_with'] = 'token1'
-
-    # Merge with token2
     merge_token2 = merged_df.merge(markets_df, left_on='asset_id', right_on='token2', how='inner')
     merge_token2['merged_with'] = 'token2'
+    combined_df = pd.concat([merge_token1, merge_token2], ignore_index=True)
 
-    # Combine the results
-    combined_df = pd.concat([merge_token1, merge_token2])
+    # Fallback: if no matches (or partial), build mapping and fill question/answer
+    if combined_df.empty or len(combined_df) < len(merged_df):
+        # Build quick maps for question/answers by token
+        t1_to_q = dict(zip(markets_df.get('token1', []), markets_df.get('question', [])))
+        t2_to_q = dict(zip(markets_df.get('token2', []), markets_df.get('question', [])))
+        t1_to_a = dict(zip(markets_df.get('token1', []), markets_df.get('answer1', [])))
+        t2_to_a = dict(zip(markets_df.get('token2', []), markets_df.get('answer2', [])))
 
-    assert len(merged_df) == len(combined_df)
+        fallback = merged_df.copy()
+        aid = fallback['asset_id'].astype(str)
+        # Question from either token map
+        fallback['question'] = aid.map(t1_to_q).fillna(aid.map(t2_to_q)).fillna('')
+        # Answer from the side that matches
+        ans1 = aid.map(t1_to_a)
+        ans2 = aid.map(t2_to_a)
+        fallback['answer'] = ans1.where(ans1.notna(), ans2).fillna('')
 
-    combined_df['answer'] = combined_df.apply(
-        lambda row: row['answer1'] if row['merged_with'] == 'token1' else row['answer2'], axis=1
-    )
+        keep_cols = ['question', 'answer', 'order_size', 'order_side', 'order_price', 'position_size', 'avgPrice', 'curPrice']
+        for col in keep_cols:
+            if col not in fallback.columns:
+                fallback[col] = 0 if col not in ('question', 'answer', 'order_side') else ''
 
-    combined_df = combined_df[['question', 'answer', 'order_size', 'order_side', 'order_price', 'position_size', 'avgPrice', 'curPrice']]
+        # Ensure combined_df has the columns before selecting
+        for col in keep_cols:
+            if col not in combined_df.columns:
+                combined_df[col] = '' if col in ('question', 'answer', 'order_side') else 0
+
+        combined_df = pd.concat([
+            combined_df[keep_cols],
+            fallback[keep_cols]
+        ], ignore_index=True).drop_duplicates().reset_index(drop=True)
+
+    # Final shaping
     combined_df['order_side'] = combined_df['order_side'].fillna('')
     combined_df = combined_df.fillna(0)
-
     combined_df['marketInSelected'] = combined_df['question'].isin(selected_df['question'])
-    combined_df = combined_df.sort_values('question')
-    combined_df = combined_df.sort_values('marketInSelected')
+    combined_df = combined_df.sort_values(['marketInSelected', 'question']).reset_index(drop=True)
     return combined_df
 
 def get_earnings(client):
@@ -112,6 +157,10 @@ def update_stats_once(client):
     selected_df = pd.DataFrame(wk_sel.get_all_records())
     
     markets_df = get_markets_df(wk_full)
+    # Ensure string types for token columns to avoid join misses
+    for col in ('token1', 'token2'):
+        if col in markets_df.columns:
+            markets_df[col] = markets_df[col].astype(str)
     print("Got spreadsheet...")
 
     orders_df = get_all_orders(client)

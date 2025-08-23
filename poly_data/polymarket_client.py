@@ -8,7 +8,7 @@ from py_clob_client.constants import POLYGON
 
 # Web3 libraries for blockchain interaction
 from web3 import Web3
-from web3.middleware import geth_poa_middleware
+from web3.middleware import ExtraDataToPOAMiddleware
 from eth_account import Account
 
 import requests                     # HTTP requests
@@ -38,7 +38,7 @@ class PolymarketClient:
     The client connects to both the Polymarket API and the Polygon blockchain.
     """
     
-    def __init__(self, pk='default') -> None:
+    def __init__(self, pk: str = 'default', initialize_api: bool = True) -> None:
         """
         Initialize the Polymarket client with API and blockchain connections.
         
@@ -54,24 +54,28 @@ class PolymarketClient:
         # Don't print sensitive wallet information
         print("Initializing Polymarket client...")
         chain_id=POLYGON
-        self.browser_wallet=Web3.toChecksumAddress(browser_address)
+        self.browser_wallet=Web3.to_checksum_address(browser_address)
 
-        # Initialize the Polymarket API client
-        self.client = ClobClient(
-            host=host,
-            key=key,
-            chain_id=chain_id,
-            funder=self.browser_wallet,
-            signature_type=2
-        )
+        # Initialize the Polymarket API client (optional)
+        self.client = None
+        self.creds = None
+        if initialize_api:
+            self.client = ClobClient(
+                host=host,
+                key=key,
+                chain_id=chain_id,
+                funder=self.browser_wallet
+            )
 
-        # Set up API credentials
-        self.creds = self.client.create_or_derive_api_creds()
-        self.client.set_api_creds(creds=self.creds)
+            # Set up API credentials
+            self.creds = self.client.create_or_derive_api_creds()
+            self.client.set_api_creds(creds=self.creds)
         
-        # Initialize Web3 connection to Polygon
-        web3 = Web3(Web3.HTTPProvider("https://polygon-rpc.com"))
-        web3.middleware_onion.inject(geth_poa_middleware, layer=0)
+        # Initialize Web3 connection to Polygon (allow override via env)
+        polygon_rpc_url = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+        # Set a request timeout to prevent hangs on eth_call
+        web3 = Web3(Web3.HTTPProvider(polygon_rpc_url, request_kwargs={"timeout": 10}))
+        web3.middleware_onion.inject(ExtraDataToPOAMiddleware, layer=0)
         
         # Set up USDC contract for balance checks
         self.usdc_contract = web3.eth.contract(
@@ -168,7 +172,10 @@ class PolymarketClient:
         Returns:
             float: Total position value in USDC
         """
-        res = requests.get(f'https://data-api.polymarket.com/value?user={self.browser_wallet}')
+        res = requests.get(
+            f'https://data-api.polymarket.com/value?user={self.browser_wallet}',
+            timeout=15,
+        )
         return float(res.json()['value'])
 
     def get_total_balance(self):
@@ -187,7 +194,10 @@ class PolymarketClient:
         Returns:
             DataFrame: All positions with details like market, size, avgPrice
         """
-        res = requests.get(f'https://data-api.polymarket.com/positions?user={self.browser_wallet}')
+        res = requests.get(
+            f'https://data-api.polymarket.com/positions?user={self.browser_wallet}',
+            timeout=15,
+        )
         return pd.DataFrame(res.json())
     
     def get_raw_position(self, tokenId):
@@ -229,6 +239,8 @@ class PolymarketClient:
         Returns:
             DataFrame: All open orders with their details
         """
+        if self.client is None:
+            return pd.DataFrame()
         orders_df = pd.DataFrame(self.client.get_orders())
 
         # Convert numeric columns to float
@@ -248,6 +260,8 @@ class PolymarketClient:
         Returns:
             DataFrame: Open orders for the specified market
         """
+        if self.client is None:
+            return pd.DataFrame()
         orders_df = pd.DataFrame(self.client.get_orders(OpenOrderParams(
             market=market,
         )))
@@ -267,6 +281,8 @@ class PolymarketClient:
         Args:
             asset_id (str): Asset token ID
         """
+        if self.client is None:
+            return
         self.client.cancel_market_orders(asset_id=str(asset_id))
 
 
@@ -278,6 +294,8 @@ class PolymarketClient:
         Args:
             marketId (str): Market ID
         """
+        if self.client is None:
+            return
         self.client.cancel_market_orders(market=marketId)
 
     
