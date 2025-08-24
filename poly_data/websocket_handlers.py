@@ -2,6 +2,7 @@ import asyncio                      # Asynchronous I/O
 import json                        # JSON handling
 import websockets                  # WebSocket client
 import traceback                   # Exception handling
+import time                        # Timing utilities
 
 from poly_data.data_processing import process_data, process_user_data
 import poly_data.global_state as global_state
@@ -33,11 +34,17 @@ async def connect_market_websocket(chunk):
 
         try:
             # Process incoming market data indefinitely
+            last_msg_time = time.time()
             while True:
-                message = await websocket.recv()
-                json_data = json.loads(message)
-                # Process order book updates and trigger trading as needed
-                process_data(json_data)
+                try:
+                    message = await asyncio.wait_for(websocket.recv(), timeout=30)
+                    json_data = json.loads(message)
+                    # Process order book updates and trigger trading as needed
+                    process_data(json_data)
+                    last_msg_time = time.time()
+                except asyncio.TimeoutError:
+                    # Heartbeat every 30s without messages
+                    print(f"Market WS heartbeat: subscribed assets {len(chunk)}, last msg {int(time.time()-last_msg_time)}s ago")
         except websockets.ConnectionClosed:
             print("Connection closed in market websocket")
             print(traceback.format_exc())
@@ -82,11 +89,24 @@ async def connect_user_websocket():
 
         try:
             # Process incoming user data indefinitely
+            last_msg_time = time.time()
+
+            # Periodic heartbeat regardless of message activity
+            async def _heartbeat():
+                while True:
+                    await asyncio.sleep(30)
+                    print(f"User WS heartbeat: last msg {int(time.time()-last_msg_time)}s ago")
+            hb_task = asyncio.create_task(_heartbeat())
             while True:
-                message = await websocket.recv()
-                json_data = json.loads(message)
-                # Process trade and order updates
-                process_user_data(json_data)
+                try:
+                    message = await asyncio.wait_for(websocket.recv(), timeout=30)
+                    json_data = json.loads(message)
+                    # Process trade and order updates
+                    process_user_data(json_data)
+                    last_msg_time = time.time()
+                except asyncio.TimeoutError:
+                    # No-op; heartbeat task will log
+                    pass
         except websockets.ConnectionClosed:
             print("Connection closed in user websocket")
             print(traceback.format_exc())
@@ -94,5 +114,9 @@ async def connect_user_websocket():
             print(f"Exception in user websocket: {e}")
             print(traceback.format_exc())
         finally:
+            try:
+                hb_task.cancel()
+            except Exception:
+                pass
             # Brief delay before attempting to reconnect
             await asyncio.sleep(5)

@@ -85,6 +85,8 @@ def fetch_and_process_data():
     wk_full = spreadsheet.worksheet("Full Markets")
 
     sel_df = get_sel_df(spreadsheet, "Selected Markets")
+
+
     all_df = get_all_markets(client)
     print("Got all Markets")
     all_results = get_all_results(all_df, client)
@@ -94,8 +96,8 @@ def fetch_and_process_data():
 
     print(f'{pd.to_datetime("now")}: Fetched all markets data of length {len(all_markets)}.')
     new_df = add_volatility_to_df(all_markets)
-    new_df['volatility_sum'] = new_df['24_hour'] + new_df['7_day'] + new_df['14_day']
-
+    new_df['volatility_sum'] =  new_df['24_hour'] + new_df['7_day'] + new_df['14_day']
+    
     new_df = new_df.sort_values('volatility_sum', ascending=True)
     new_df['volatilty/reward'] = ((new_df['gm_reward_per_100'] / new_df['volatility_sum']).round(2)).astype(str)
 
@@ -103,12 +105,15 @@ def fetch_and_process_data():
                      'best_bid', 'best_ask', 'volatility_price', 'max_spread', 'tick_size',  
                      'neg_risk',  'market_slug', 'token1', 'token2', 'condition_id']]
 
+    
     volatility_df = new_df.copy()
     volatility_df = volatility_df[new_df['volatility_sum'] < 20]
     # volatility_df = sort_df(volatility_df)
     volatility_df = volatility_df.sort_values('gm_reward_per_100', ascending=False)
    
     new_df = new_df.sort_values('gm_reward_per_100', ascending=False)
+    
+
     print(f'{pd.to_datetime("now")}: Fetched select market of length {len(new_df)}.')
 
     if len(new_df) > 50:
