@@ -1,5 +1,10 @@
 import time
+import json
+import logging
+from typing import Any, Dict, List
+
 import pandas as pd
+import requests
 from data_updater.trading_utils import get_clob_client
 from data_updater.google_utils import get_spreadsheet
 from data_updater.find_markets import get_sel_df, get_all_markets, get_all_results, get_markets, add_volatility_to_df
@@ -60,10 +65,7 @@ def sort_df(df):
     
     # Create a composite score (higher is better for rewards, lower is better for volatility, with proximity scores)
     df['composite_score'] = (
-        df['std_gm_reward_per_100'] - 
-        df['std_volatility_sum'] + 
-        df['bid_score'] + 
-        df['ask_score']
+        df['std_gm_reward_per_100'] - df['std_volatility_sum'] + df['bid_score'] + df['ask_score']
     )
     
     # Sort by the composite score in descending order
@@ -74,6 +76,84 @@ def sort_df(df):
     
     return sorted_df
 
+logger = logging.getLogger(__name__)
+
+def _safe_parse_array(value: Any) -> List[Any]:
+    """
+    Parse a value that may be a JSON-encoded array string into a Python list.
+    If it's already a list, return as-is; otherwise return an empty list on failure.
+    """
+    if isinstance(value, list):
+        return value
+    if isinstance(value, str):
+        try:
+            parsed = json.loads(value)
+            return parsed if isinstance(parsed, list) else []
+        except Exception:
+            return []
+    return []
+
+def _map_gamma_market_to_expected_schema(market: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Map a single Gamma /markets object to the schema expected by find_markets.process_single_row.
+    """
+    clob_token_ids = _safe_parse_array(market.get("clobTokenIds") or market.get("clob_token_ids"))
+    outcomes = _safe_parse_array(market.get("outcomes"))
+    outcome_prices = _safe_parse_array(market.get("outcomePrices") or market.get("outcome_prices"))
+
+    tokens: List[Dict[str, Any]] = []
+    for idx in range(min(len(clob_token_ids), len(outcomes))):
+        token = {
+            "token_id": str(clob_token_ids[idx]),
+            "outcome": outcomes[idx],
+            "price": float(outcome_prices[idx]) if idx < len(outcome_prices) else 0.0,
+            "winner": False,
+        }
+        tokens.append(token)
+
+    rewards_obj: Dict[str, Any] = {
+        "rates": [],  # Not exposed by Gamma; downstream handles empty as zero
+        "min_size": market.get("rewardsMinSize", market.get("orderMinSize", 0)),
+        "max_spread": market.get("rewardsMaxSpread", 0),
+    }
+
+    mapped = {
+        "question": market.get("question", ""),
+        "neg_risk": market.get("negRisk", market.get("neg_risk", False)),
+        "tokens": tokens,
+        "rewards": rewards_obj,
+        "minimum_tick_size": market.get("orderPriceMinTickSize", market.get("minimum_tick_size", 0.01)),
+        "end_date_iso": market.get("endDateIso", market.get("end_date_iso")),
+        "market_slug": market.get("slug", market.get("market_slug", "")),
+        "condition_id": market.get("conditionId", market.get("condition_id", "")),
+    }
+
+    return mapped
+
+def get_all_markets_gamma(limit: int = 500) -> pd.DataFrame:
+    """
+    Fetch markets from Gamma API and map to the schema expected by find_markets.
+    """
+    url = "https://gamma-api.polymarket.com/markets"
+    params = {
+        "limit": limit,
+        "active": True,
+        "closed": False,
+        "order": "volume",
+        "ascending": False,
+    }
+    try:
+        resp = requests.get(url, params=params, timeout=30)
+        resp.raise_for_status()
+        markets: List[Dict[str, Any]] = resp.json()
+    except Exception as ex:
+        logger.error("Failed to fetch Gamma markets: %s", ex)
+        # Fall back to empty DataFrame; upstream code will handle empty gracefully
+        return pd.DataFrame()
+
+    mapped_rows = [_map_gamma_market_to_expected_schema(m) for m in markets]
+    return pd.DataFrame(mapped_rows)
+
 def fetch_and_process_data():
     global spreadsheet, client, wk_all, wk_vol, sel_df
     
@@ -83,11 +163,12 @@ def fetch_and_process_data():
     wk_all = spreadsheet.worksheet("All Markets")
     wk_vol = spreadsheet.worksheet("Volatility Markets")
     wk_full = spreadsheet.worksheet("Full Markets")
-
     sel_df = get_sel_df(spreadsheet, "Selected Markets")
-
-
-    all_df = get_all_markets(client)
+    # Prefer Gamma /markets endpoint for market metadata
+    all_df = get_all_markets_gamma()
+    if len(all_df) == 0:
+        print("Gamma markets fetch returned empty; falling back to client sampling markets")
+        all_df = get_all_markets(client)
     print("Got all Markets")
     all_results = get_all_results(all_df, client)
     print("Got all Results")
@@ -96,24 +177,19 @@ def fetch_and_process_data():
 
     print(f'{pd.to_datetime("now")}: Fetched all markets data of length {len(all_markets)}.')
     new_df = add_volatility_to_df(all_markets)
-    new_df['volatility_sum'] =  new_df['24_hour'] + new_df['7_day'] + new_df['14_day']
-    
+    new_df['volatility_sum'] = new_df['24_hour'] + new_df['7_day'] + new_df['14_day']
+
     new_df = new_df.sort_values('volatility_sum', ascending=True)
     new_df['volatilty/reward'] = ((new_df['gm_reward_per_100'] / new_df['volatility_sum']).round(2)).astype(str)
 
-    new_df = new_df[['question', 'answer1', 'answer2', 'spread', 'rewards_daily_rate', 'gm_reward_per_100', 'sm_reward_per_100', 'bid_reward_per_100', 'ask_reward_per_100',  'volatility_sum', 'volatilty/reward', 'min_size', '1_hour', '3_hour', '6_hour', '12_hour', '24_hour', '7_day', '30_day',  
-                     'best_bid', 'best_ask', 'volatility_price', 'max_spread', 'tick_size',  
-                     'neg_risk',  'market_slug', 'token1', 'token2', 'condition_id']]
+    new_df = new_df[['question', 'answer1', 'answer2', 'spread', 'rewards_daily_rate', 'gm_reward_per_100', 'sm_reward_per_100', 'bid_reward_per_100', 'ask_reward_per_100', 'volatility_sum', 'volatilty/reward', 'min_size', '1_hour', '3_hour', '6_hour', '12_hour', '24_hour', '7_day', '30_day', 'best_bid', 'best_ask', 'volatility_price', 'max_spread', 'tick_size', 'neg_risk', 'market_slug', 'token1', 'token2', 'condition_id']]
 
-    
     volatility_df = new_df.copy()
     volatility_df = volatility_df[new_df['volatility_sum'] < 20]
     # volatility_df = sort_df(volatility_df)
     volatility_df = volatility_df.sort_values('gm_reward_per_100', ascending=False)
    
     new_df = new_df.sort_values('gm_reward_per_100', ascending=False)
-    
-
     print(f'{pd.to_datetime("now")}: Fetched select market of length {len(new_df)}.')
 
     if len(new_df) > 50:
