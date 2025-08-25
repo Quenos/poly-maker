@@ -2,8 +2,10 @@ import pandas as pd
 import numpy as np
 import os
 import requests
-import time
 import warnings
+import concurrent.futures
+import time 
+
 warnings.filterwarnings("ignore")
 
 
@@ -16,7 +18,7 @@ def get_sel_df(spreadsheet, sheet_name='Selected Markets'):
         sel_df = pd.DataFrame(wk2.get_all_records())
         sel_df = sel_df[sel_df['question'] != ""].reset_index(drop=True)
         return sel_df
-    except:
+    except:  # noqa: E722
         return pd.DataFrame()
     
 def get_all_markets(client):
@@ -25,19 +27,16 @@ def get_all_markets(client):
 
     while True:
         try:
-            markets = client.get_sampling_markets(next_cursor = cursor)
+            markets = client.get_sampling_markets(next_cursor=cursor)
             markets_df = pd.DataFrame(markets['data'])
 
-
             cursor = markets['next_cursor']
-            
-
-
             all_markets.append(markets_df)
 
             if cursor is None:
                 break
-        except:
+            time.sleep(3)
+        except:  # noqa: E722
             break
 
     all_df = pd.concat(all_markets)
@@ -47,7 +46,7 @@ def get_all_markets(client):
 
 def get_bid_ask_range(ret, TICK_SIZE):
     bid_from = ret['midpoint'] - ret['max_spread'] / 100
-    bid_to = ret['best_ask'] #Although bid to this high up will change bid_from because of changing midpoint, take optimistic approach
+    bid_to = ret['best_ask']  # Although bid to this high up will change bid_from because of changing midpoint, take optimistic approach
 
     if bid_to == 0:
         bid_to = ret['midpoint']
@@ -89,7 +88,7 @@ def generate_numbers(start, end, TICK_SIZE):
     rounded_start = (int(start * 100) + 1) / 100 if start * 100 % 1 != 0 else start + TICK_SIZE
     
     # Calculate the ending point, rounding down to the nearest hundredth
-    rounded_end = int(end * 100) / 100
+    # rounded_end = int(end * 100) / 100
     
     # Generate numbers from rounded_start to rounded_end, ensuring they fall strictly within the original bounds
     numbers = []
@@ -140,23 +139,22 @@ def process_single_row(row, client):
 
     try:
         bids = pd.DataFrame(book.bids).astype(float)
-    except:
+    except:  # noqa: E722
         pass
 
     try:
         asks = pd.DataFrame(book.asks).astype(float)
-    except:
+    except:  # noqa: E722
         pass
-
 
     try:
         ret['best_bid'] = bids.iloc[-1]['price']
-    except:
+    except:  # noqa: E722
         ret['best_bid'] = 0
 
     try:
         ret['best_ask'] = asks.iloc[-1]['price']
-    except:
+    except:  # noqa: E722
         ret['best_ask'] = 0
 
     ret['midpoint'] = (ret['best_bid'] + ret['best_ask']) / 2
@@ -175,13 +173,13 @@ def process_single_row(row, client):
 
     try:
         bids_df = bids_df.merge(bids, on='price', how='left').fillna(0)
-    except:
+    except:  # noqa: E722
         bids_df = pd.DataFrame()
 
     try:
         asks_df = asks_df.merge(asks, on='price', how='left').fillna(0)
-    except:
-        asks_df = pd.DataFrame()
+    except:  # noqa: E722
+        asks_df = pd.DataFrame()    
 
     best_bid_reward = 0
     ret_bid = pd.DataFrame()
@@ -189,7 +187,7 @@ def process_single_row(row, client):
     try:
         ret_bid = add_formula_params(bids_df, ret['midpoint'], v, rate)
         best_bid_reward = round(ret_bid['reward_per_100'].max(), 2)
-    except:
+    except:  # noqa: E722
         pass
 
     best_ask_reward = 0
@@ -198,7 +196,7 @@ def process_single_row(row, client):
     try:
         ret_ask = add_formula_params(asks_df, ret['midpoint'], v, rate)
         best_ask_reward = round(ret_ask['reward_per_100'].max(), 2)
-    except:
+    except:  # noqa: E722
         pass
 
     ret['bid_reward_per_100'] = best_bid_reward
@@ -223,7 +221,7 @@ def get_all_results(all_df, client, max_workers=5):
         idx, row = args
         try:
             return process_single_row(row, client)
-        except:
+        except:  # noqa: E722
             print("error fetching market")
             return None
 
@@ -253,7 +251,6 @@ def get_combined_markets(new_df, new_markets, sel_df):
     all_markets = all_markets.sort_values('gm_reward_per_100', ascending=False)
     return all_markets
 
-import concurrent.futures
 
 def calculate_annualized_volatility(df, hours):
     end_time = df['t'].max()
@@ -300,7 +297,7 @@ def add_volatility_to_df(df, max_workers=3):
         try:
             ret = add_volatility(row.to_dict())
             return ret
-        except:
+        except:  # noqa: E722
             print("Error fetching volatility")
             return None
 
@@ -329,7 +326,6 @@ def get_markets(all_results, sel_df, maker_reward=1):
     all_data = new_df.copy()
     s_df = new_df.copy()
     
-
     making_markets = s_df[~new_df['question'].isin(sel_df['question'])]
     making_markets = making_markets.sort_values('gm_reward_per_100', ascending=False)
     making_markets = making_markets[making_markets['gm_reward_per_100'] >= maker_reward]

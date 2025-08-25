@@ -473,6 +473,44 @@ def main() -> None:
         # PnL includes Realized, Unrealized and Earnings
         summary["Pnl"] = summary.get("Realized PnL", 0.0) + summary.get("Unrealized PnL", 0.0) + summary.get("Earnings", 0.0)
 
+        # Derive Yes/No (outcome) for the open market position by selecting the token_id
+        # with the largest absolute net shares per market, then mapping token_id -> outcome
+        token_to_outcome = {}
+        try:
+            wk_all_mkts = spreadsheet.worksheet("All Markets")
+            all_mkts_df = pd.DataFrame(wk_all_mkts.get_all_records())
+            if not all_mkts_df.empty:
+                for _, r in all_mkts_df.iterrows():
+                    t1 = str(r.get("token1", ""))
+                    t2 = str(r.get("token2", ""))
+                    a1 = str(r.get("answer1", ""))
+                    a2 = str(r.get("answer2", ""))
+                    if t1:
+                        token_to_outcome[t1] = a1
+                    if t2:
+                        token_to_outcome[t2] = a2
+        except Exception:
+            pass
+
+        yes_no_col = []
+        try:
+            token_shares = pnl_all_df.groupby(["market", "token_id"], dropna=False)["shares"].sum().reset_index()
+            # pick token with max absolute shares per market
+            idx = (
+                token_shares.assign(abs_shares=token_shares["shares"].abs())
+                .sort_values(["market", "abs_shares"]) 
+                .groupby("market")
+                .tail(1)
+            )
+            market_to_token = {str(r["market"]): str(r["token_id"]) for _, r in idx.iterrows()}
+            for _, r in summary.iterrows():
+                m = str(r.get("market", ""))
+                tok = market_to_token.get(m, "")
+                yes_no_col.append(token_to_outcome.get(tok, ""))
+        except Exception:
+            yes_no_col = [""] * len(summary)
+        summary["yes_no"] = yes_no_col
+
         # Determine if market is in Selected Markets sheet
         try:
             wk_sel = spreadsheet.worksheet("Selected Markets")
@@ -513,16 +551,18 @@ def main() -> None:
                     existing_sum["Pnl"] = 0.0
                 if "marketInSelected" not in existing_sum.columns:
                     existing_sum["marketInSelected"] = "no"
+                if "yes_no" not in existing_sum.columns:
+                    existing_sum["yes_no"] = ""
                 existing_sum = existing_sum[~existing_sum["market"].astype(str).isin(summary["market"].astype(str))]
                 out_df = pd.concat([
-                    existing_sum[["market", "position_size", "Realized PnL", "Unrealized PnL", "Earnings", "Pnl", "marketInSelected"]],
-                    summary[["market", "position_size", "Realized PnL", "Unrealized PnL", "Earnings", "Pnl", "marketInSelected"]]
+                    existing_sum[["market", "position_size", "yes_no", "Realized PnL", "Unrealized PnL", "Earnings", "Pnl", "marketInSelected"]],
+                    summary[["market", "position_size", "yes_no", "Realized PnL", "Unrealized PnL", "Earnings", "Pnl", "marketInSelected"]]
                 ], ignore_index=True)
             else:
-                out_df = summary[["market", "position_size", "Realized PnL", "Unrealized PnL", "Earnings", "Pnl", "marketInSelected"]]
+                out_df = summary[["market", "position_size", "yes_no", "Realized PnL", "Unrealized PnL", "Earnings", "Pnl", "marketInSelected"]]
         except Exception:
             wk_summary = spreadsheet.add_worksheet(title="Position Summary", rows=500, cols=10)
-            out_df = summary[["market", "position_size", "Realized PnL", "Unrealized PnL", "Earnings", "Pnl", "marketInSelected"]]
+            out_df = summary[["market", "position_size", "yes_no", "Realized PnL", "Unrealized PnL", "Earnings", "Pnl", "marketInSelected"]]
 
         set_with_dataframe(
             wk_summary,
