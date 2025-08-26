@@ -16,8 +16,8 @@
 const { ethers } = require('ethers');
 const { resolve } = require('path');
 const { existsSync } = require('fs');
-const { signAndExecuteSafeTransaction } = require('./safe-helpers');
-const { safeAbi } = require('./safeAbi');
+// const { signAndExecuteSafeTransaction } = require('./safe-helpers');
+// const { safeAbi } = require('./safeAbi');
 
 // Load environment variables
 const localEnvPath = resolve(__dirname, '.env');
@@ -87,37 +87,30 @@ async function mergePositions(amountToMerge, conditionId, isNegRiskMarket) {
       );
     }
 
-    // Prepare full transaction object
-    const transaction = {
-      ...tx,
-      chainId: 137,       // Polygon chain ID
-      gasPrice: gasPrice,
-      gasLimit: gasLimit,
-      nonce: nonce
-    };
-
-    // Get the Safe address from environment variables
-    const safeAddress = process.env.BROWSER_ADDRESS;
-    const safe = new ethers.Contract(safeAddress, safeAbi, wallet);
-
-    // Execute the transaction through the Safe
-    console.log("Signing Transaction")
-    const txResponse = await signAndExecuteSafeTransaction(
-      wallet, 
-      safe, 
-      transaction.to, 
-      transaction.data, 
-      { 
-        gasPrice: transaction.gasPrice, 
-        gasLimit: transaction.gasLimit 
-      }
-    );
-    
-    console.log("Sent transaction. Waiting for response")
-    const txReceipt = await txResponse.wait();
-    
-    console.log("merge positions " + txReceipt.transactionHash);
-    return txReceipt.transactionHash;
+    // Direct EOA send (no Safe)
+    const feeData = await provider.getFeeData();
+    let txResponse;
+    try {
+      txResponse = await wallet.sendTransaction({
+        to: tx.to,
+        data: tx.data,
+        gasLimit: gasLimit,
+        maxFeePerGas: feeData.maxFeePerGas ?? gasPrice,
+        maxPriorityFeePerGas: feeData.maxPriorityFeePerGas ?? gasPrice,
+        nonce: nonce
+      });
+    } catch (err) {
+      console.error("Send failed:", err?.reason || err?.message || err);
+      throw err;
+    }
+    console.log("Submitted tx:", txResponse.hash);
+    const receipt = await provider.waitForTransaction(txResponse.hash, 1, 120000);
+    if (!receipt) {
+      console.log("Timed out waiting for confirmation. Check explorer:", txResponse.hash);
+      return txResponse.hash;
+    }
+    console.log("merge positions " + receipt.transactionHash);
+    return receipt.transactionHash;
 }
 
 // Parse command line arguments

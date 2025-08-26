@@ -16,3 +16,5 @@ cryptography==42.0.8
 google-auth
 setuptools
 web3>=7.6.0
+fastapi==0.115.4
+uvicorn[standard]==0.30.6

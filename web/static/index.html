@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Poly Maker Dashboard</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="container">
+      <h1>Poly Maker Dashboard</h1>
+
+      <section>
+        <h2>Open Orders</h2>
+        <table id="orders">
+          <thead>
+            <tr>
+              <th>Market</th>
+              <th>Outcome</th>
+              <th>Side</th>
+              <th>Price</th>
+              <th>Orig Size</th>
+              <th>Matched</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Positions</h2>
+        <table id="positions">
+          <thead>
+            <tr>
+              <th>Market</th>
+              <th>Outcome</th>
+              <th>Size</th>
+              <th>Avg Price</th>
+              <th>Cur Price</th>
+              <th>PnL %</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Last Trades</h2>
+        <table id="trades">
+          <thead>
+            <tr>
+              <th>Market</th>
+              <th>Outcome</th>
+              <th>Side</th>
+              <th>Shares</th>
+              <th>Price</th>
+              <th>Time</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+        <div class="pagination" id="pagination"></div>
+      </section>
+    </div>
+
+    <script>
+      async function fetchJson(url) {
+        const res = await fetch(url, { cache: 'no-store' });
+        if (!res.ok) throw new Error('Request failed: ' + url);
+        return res.json();
+      }
+
+      function setRows(tbody, rows, columns) {
+        tbody.innerHTML = '';
+        for (const row of rows) {
+          const tr = document.createElement('tr');
+          for (const c of columns) {
+            const td = document.createElement('td');
+            let v = row[c];
+            if (typeof v === 'number') {
+              v = Math.abs(v) > 1e6 ? v.toFixed(2) : v;
+            }
+            td.textContent = v == null ? '' : v;
+            tr.appendChild(td);
+          }
+          tbody.appendChild(tr);
+        }
+      }
+
+      let tradePage = 1;
+      const tradesPerPage = 10;
+
+      function makeButton(label, page, disabled=false, active=false) {
+        const btn = document.createElement('button');
+        btn.textContent = label;
+        if (disabled) btn.disabled = true;
+        if (active) btn.className = 'active';
+        if (!disabled && !active && typeof page === 'number') {
+          btn.addEventListener('click', () => { tradePage = page; refresh(); });
+        }
+        return btn;
+      }
+
+      function renderPagination(totalPages) {
+        const container = document.getElementById('pagination');
+        container.innerHTML = '';
+        // Prev
+        container.appendChild(makeButton('<', tradePage - 1, tradePage <= 1));
+
+        const pages = [];
+        if (totalPages <= 5) {
+          for (let p = 1; p <= totalPages; p++) pages.push(p);
+        } else {
+          pages.push(1);
+          if (tradePage > 3) pages.push('…');
+          const start = Math.max(2, tradePage - 1);
+          const end = Math.min(totalPages - 1, tradePage + 1);
+          for (let p = start; p <= end; p++) pages.push(p);
+          if (tradePage < totalPages - 2) pages.push('…');
+          pages.push(totalPages);
+        }
+
+        for (const p of pages) {
+          if (p === '…') {
+            const span = document.createElement('span');
+            span.textContent = '…';
+            container.appendChild(span);
+          } else {
+            container.appendChild(makeButton(String(p), p, false, p === tradePage));
+          }
+        }
+
+        // Next
+        container.appendChild(makeButton('>', tradePage + 1, tradePage >= totalPages));
+      }
+
+      async function refresh() {
+        try {
+          const [orders, positions, trades] = await Promise.all([
+            fetchJson('/api/orders'),
+            fetchJson('/api/positions'),
+            fetchJson(`/api/trades?limit=${tradesPerPage}&page=${tradePage}`),
+          ]);
+
+          setRows(document.querySelector('#orders tbody'), orders.data || [], [
+            'market_name', 'outcome', 'side', 'price', 'original_size', 'size_matched', 'status'
+          ]);
+          setRows(
+            document.querySelector('#positions tbody'),
+            positions.data || [],
+            ['market_name', 'outcome', 'size', 'avgPrice', 'curPrice', 'percentPnl']
+          );
+          setRows(document.querySelector('#trades tbody'), trades.data || [], [
+            'market_name', 'outcome', 'side', 'size', 'price', 'datetime'
+          ]);
+          const totalPages = trades.total ? Math.max(1, Math.ceil(trades.total / tradesPerPage)) : 1;
+          renderPagination(totalPages);
+        } catch (e) {
+          console.error(e);
+        }
+      }
+
+      refresh();
+      setInterval(refresh, 5000);
+
+      // pagination buttons are created dynamically in renderPagination
+    </script>
+  </body>
+  </html>
+
+

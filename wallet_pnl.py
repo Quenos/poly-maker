@@ -235,8 +235,8 @@ def build_pnl_rows_from_activity(activity: pd.DataFrame) -> pd.DataFrame:
     shares_signed = shares_series.where(side_series != "SELL", -shares_series)
 
     dates = pd.to_datetime(ts_series, unit="s")
-    # Notional price (USDC): shares * unit price
-    notional_series = shares_signed * price_series
+    # Notional value (USDC): buys negative (cash out), sells positive (cash in)
+    notional_series = -shares_signed * price_series
     pnl_df = pd.DataFrame({
         "type": "trades",
         "token_id": token_series,
@@ -368,7 +368,8 @@ def main() -> None:
                 return token + "|" + side + "|" + open_price.astype(str) + "|" + shares.astype(str) + "|" + open_ts.astype(str)
 
             keys = build_keys(combined)
-            deduped = combined.loc[~keys.duplicated(keep="first")].copy()
+            # Prefer the newest computation for a given trade signature
+            deduped = combined.loc[~keys.duplicated(keep="last")].copy()
             # Ensure 'date' is datetime before sorting (can be NaT for some rows)
             if "date" in deduped.columns:
                 try:
@@ -409,44 +410,77 @@ def main() -> None:
         # Ensure numeric fields
         pnl_all_df["shares"] = pd.to_numeric(pnl_all_df.get("shares", 0), errors="coerce").fillna(0.0)
         pnl_all_df["price"] = pd.to_numeric(pnl_all_df.get("price", 0), errors="coerce").fillna(0.0)
-        # Aggregations per market
-        summary = pnl_all_df.groupby("market", dropna=False)["shares"].sum().reset_index()
-        summary = summary.rename(columns={"shares": "position_size"})
-        realized = pnl_all_df.groupby("market", dropna=False)["price"].sum().reset_index()
-        realized = realized.rename(columns={"price": "Realized PnL"})
-        summary = summary.merge(realized, on="market", how="left")
+        # Aggregations per market AND outcome (treat YES/NO separately)
+        group_keys = ["market", "yes/no"] if "yes/no" in pnl_all_df.columns else ["market"]
+        summary = pnl_all_df.groupby(group_keys, dropna=False)["shares"].sum().reset_index()
+        if "yes/no" in summary.columns:
+            summary = summary.rename(columns={"shares": "position_size", "yes/no": "yes_no"})
+        else:
+            summary = summary.rename(columns={"shares": "position_size"})
+
+        realized = pnl_all_df.groupby(group_keys, dropna=False)["price"].sum().reset_index()
+        if "yes/no" in realized.columns:
+            realized = realized.rename(columns={"price": "Realized PnL", "yes/no": "yes_no"})
+            summary = summary.merge(realized, on=["market", "yes_no"], how="left")
+        else:
+            realized = realized.rename(columns={"price": "Realized PnL"})
+            summary = summary.merge(realized, on="market", how="left")
+
+        # Ensure all markets present in data are listed, even if position_size is exactly 0
+        try:
+            all_markets = (
+                pnl_all_df.get("market")
+                .astype(str)
+                .dropna()
+                .unique()
+            )
+            if len(all_markets) > 0:
+                summary = summary.set_index("market")
+                for m in all_markets:
+                    if str(m) not in summary.index:
+                        summary.loc[str(m)] = {
+                            "position_size": 0.0,
+                            "Realized PnL": 0.0,
+                        }
+                summary = summary.reset_index()
+        except Exception:
+            pass
 
         # Compute Unrealized PnL from best prices for markets with open positions
         try:
-            # Map market -> representative token_id and infer side for pricing
-            # Use the latest trade per market from PnL to pick a token_id and side context
+            # Map (market, yes/no) -> representative token_id and side context using the latest trade
             pnl_all_df["date_ts"] = pd.to_datetime(pnl_all_df.get("date")).astype("int64") // 10**9
-            latest_by_market = pnl_all_df.sort_values("date_ts").groupby("market").tail(1)
+            if "yes/no" in pnl_all_df.columns:
+                latest_by_key = pnl_all_df.sort_values("date_ts").groupby(["market", "yes/no"]).tail(1)
+            else:
+                latest_by_key = pnl_all_df.sort_values("date_ts").groupby(["market"]).tail(1)
         except Exception:
-            latest_by_market = pnl_all_df.groupby("market").head(1)
+            if "yes/no" in pnl_all_df.columns:
+                latest_by_key = pnl_all_df.groupby(["market", "yes/no"]).head(1)
+            else:
+                latest_by_key = pnl_all_df.groupby(["market"]).head(1)
 
         market_to_token = {}
-        token_col = "token_id" if "token_id" in latest_by_market.columns else None
-        for _, r in latest_by_market.iterrows():
+        token_col = "token_id" if "token_id" in latest_by_key.columns else None
+        for _, r in latest_by_key.iterrows():
             m = str(r.get("market", ""))
+            y = str(r.get("yes/no", "")) if "yes/no" in latest_by_key.columns else ""
             if not m:
                 continue
             if token_col and str(r.get(token_col, "")):
-                market_to_token[m] = str(r.get(token_col, ""))
-            # For side, if we are long (position_size > 0), use best sell to value liquidation; if short (negative), use best buy
-            # We'll set side after merging positions below
+                market_to_token[(m, y)] = str(r.get(token_col, ""))
 
         # Merge position_size into a frame to compute unrealized
-        pos_df = summary[["market", "position_size"]].copy()
+        key_cols = ["market", "yes_no"] if "yes_no" in summary.columns else ["market"]
+        pos_df = summary[key_cols + ["position_size"]].copy()
         pos_df["best_price"] = 0.0
         pos_df["Unrealized PnL"] = 0.0
 
         for i, row in pos_df.iterrows():
             mkt = str(row["market"])
             size = float(row["position_size"]) if row["position_size"] is not None else 0.0
-            if abs(size) < 1e-12:
-                continue
-            token = market_to_token.get(mkt)
+            yes_no_val = str(row.get("yes_no", "")) if "yes_no" in pos_df.columns else ""
+            token = market_to_token.get((mkt, yes_no_val)) if ("yes_no" in pos_df.columns) else market_to_token.get(mkt)
             if not token:
                 continue
             side = "sell" if size > 0 else "buy"  # long -> sell to close, short -> buy to close
@@ -455,7 +489,10 @@ def main() -> None:
             # Unrealized is negative of liquidation value per request
             pos_df.at[i, "Unrealized PnL"] = -(best * size)
 
-        summary = summary.merge(pos_df[["market", "Unrealized PnL"]], on="market", how="left")
+        if "yes_no" in summary.columns:
+            summary = summary.merge(pos_df[["market", "yes_no", "Unrealized PnL"]], on=["market", "yes_no"], how="left")
+        else:
+            summary = summary.merge(pos_df[["market", "Unrealized PnL"]], on="market", how="left")
         summary["Unrealized PnL"] = pd.to_numeric(summary.get("Unrealized PnL", 0.0), errors="coerce").fillna(0.0)
 
         # Fetch and merge Earnings (rewards) per market; default to 0 when absent
@@ -473,43 +510,42 @@ def main() -> None:
         # PnL includes Realized, Unrealized and Earnings
         summary["Pnl"] = summary.get("Realized PnL", 0.0) + summary.get("Unrealized PnL", 0.0) + summary.get("Earnings", 0.0)
 
-        # Derive Yes/No (outcome) for the open market position by selecting the token_id
-        # with the largest absolute net shares per market, then mapping token_id -> outcome
-        token_to_outcome = {}
-        try:
-            wk_all_mkts = spreadsheet.worksheet("All Markets")
-            all_mkts_df = pd.DataFrame(wk_all_mkts.get_all_records())
-            if not all_mkts_df.empty:
-                for _, r in all_mkts_df.iterrows():
-                    t1 = str(r.get("token1", ""))
-                    t2 = str(r.get("token2", ""))
-                    a1 = str(r.get("answer1", ""))
-                    a2 = str(r.get("answer2", ""))
-                    if t1:
-                        token_to_outcome[t1] = a1
-                    if t2:
-                        token_to_outcome[t2] = a2
-        except Exception:
-            pass
+        # Preserve existing yes_no from grouping; only backfill if missing
+        if "yes_no" not in summary.columns or summary["yes_no"].isna().all():
+            token_to_outcome = {}
+            try:
+                wk_all_mkts = spreadsheet.worksheet("All Markets")
+                all_mkts_df = pd.DataFrame(wk_all_mkts.get_all_records())
+                if not all_mkts_df.empty:
+                    for _, r in all_mkts_df.iterrows():
+                        t1 = str(r.get("token1", ""))
+                        t2 = str(r.get("token2", ""))
+                        a1 = str(r.get("answer1", ""))
+                        a2 = str(r.get("answer2", ""))
+                        if t1:
+                            token_to_outcome[t1] = a1
+                        if t2:
+                            token_to_outcome[t2] = a2
+            except Exception:
+                pass
 
-        yes_no_col = []
-        try:
-            token_shares = pnl_all_df.groupby(["market", "token_id"], dropna=False)["shares"].sum().reset_index()
-            # pick token with max absolute shares per market
-            idx = (
-                token_shares.assign(abs_shares=token_shares["shares"].abs())
-                .sort_values(["market", "abs_shares"]) 
-                .groupby("market")
-                .tail(1)
-            )
-            market_to_token = {str(r["market"]): str(r["token_id"]) for _, r in idx.iterrows()}
-            for _, r in summary.iterrows():
-                m = str(r.get("market", ""))
-                tok = market_to_token.get(m, "")
-                yes_no_col.append(token_to_outcome.get(tok, ""))
-        except Exception:
-            yes_no_col = [""] * len(summary)
-        summary["yes_no"] = yes_no_col
+            yes_no_col = []
+            try:
+                token_shares = pnl_all_df.groupby(["market", "token_id"], dropna=False)["shares"].sum().reset_index()
+                idx = (
+                    token_shares.assign(abs_shares=token_shares["shares"].abs())
+                    .sort_values(["market", "abs_shares"]) 
+                    .groupby("market")
+                    .tail(1)
+                )
+                m2t = {str(r["market"]): str(r["token_id"]) for _, r in idx.iterrows()}
+                for _, r in summary.iterrows():
+                    m = str(r.get("market", ""))
+                    tok = m2t.get(m, "")
+                    yes_no_col.append(token_to_outcome.get(tok, ""))
+            except Exception:
+                yes_no_col = [""] * len(summary)
+            summary["yes_no"] = yes_no_col
 
         # Determine if market is in Selected Markets sheet
         try:

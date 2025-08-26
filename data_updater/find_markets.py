@@ -4,7 +4,6 @@ import os
 import requests
 import warnings
 import concurrent.futures
-import time 
 
 warnings.filterwarnings("ignore")
 
@@ -35,7 +34,6 @@ def get_all_markets(client):
 
             if cursor is None:
                 break
-            time.sleep(3)
         except:  # noqa: E722
             break
 

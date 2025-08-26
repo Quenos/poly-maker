@@ -4,6 +4,8 @@ from data_updater.trading_utils import get_clob_client
 from data_updater.google_utils import get_spreadsheet
 from data_updater.find_markets import get_sel_df, get_all_markets, get_all_results, get_markets, add_volatility_to_df
 from gspread_dataframe import set_with_dataframe
+from append_stored_markets_to_all import append_missing_rows
+from store_selected_markets import sync_selected_markets_to_stored
 import traceback
 
 # Initialize global variables
@@ -121,7 +123,11 @@ def fetch_and_process_data():
 if __name__ == "__main__":
     while True:
         try:
+            # Save the entries in all markets data drom selected markets to stored markets
+            sync_selected_markets_to_stored()
             fetch_and_process_data()
+            # append missing rows from selected markets to all markets
+            append_missing_rows()
             time.sleep(60 * 60)  # Sleep for an hour
         except Exception as e:
             traceback.print_exc()

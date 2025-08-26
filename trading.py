@@ -161,29 +161,33 @@ async def perform_trade(market):
             ]
             print(f"\n\n{pd.Timestamp.utcnow().tz_localize(None)}: {row['question']}")
 
-            # Get current positions for both outcomes
-            pos_1 = get_position(row['token1'])['size']
-            pos_2 = get_position(row['token2'])['size']
+            # Get current positions for both outcomes (shares)
+            pos_1 = get_position(row['token1'])['size']  # shares (decimal units)
+            pos_2 = get_position(row['token2'])['size']  # shares (decimal units)
 
             # ------- POSITION MERGING LOGIC -------
-            # Calculate if we have opposing positions that can be merged
-            amount_to_merge = min(pos_1, pos_2)
-            
-            # Only merge if positions are above minimum threshold
-            if float(amount_to_merge) > CONSTANTS.MIN_MERGE_SIZE:
-                # Get exact position sizes from blockchain for merging
-                pos_1 = client.get_position(row['token1'])[0]
-                pos_2 = client.get_position(row['token2'])[0]
-                amount_to_merge = min(pos_1, pos_2)
+            # Require both sides (in shares) before attempting on-chain merge
+            shares1 = pos_1
+            shares2 = pos_2
+
+            if shares1 >= CONSTANTS.MIN_MERGE_SIZE and shares2 >= CONSTANTS.MIN_MERGE_SIZE:
+                # Reconfirm on-chain using raw units
+                raw1, s1 = client.get_position(row['token1'])  # (raw, shares)
+                raw2, s2 = client.get_position(row['token2'])
+                amount_to_merge = min(raw1, raw2)
                 scaled_amt = amount_to_merge / 10**6
-                
-                if scaled_amt > CONSTANTS.MIN_MERGE_SIZE:
-                    print(f"Position 1 is of size {pos_1} and Position 2 is of size {pos_2}. Merging positions")
-                    # Execute the merge operation
-                    client.merge_positions(amount_to_merge, market, row['neg_risk'] == 'TRUE')
-                    # Update our local position tracking
-                    set_position(row['token1'], 'SELL', scaled_amt, 0, 'merge')
-                    set_position(row['token2'], 'SELL', scaled_amt, 0, 'merge')
+
+                if scaled_amt >= CONSTANTS.MIN_MERGE_SIZE:
+                    print(f"Confirmed merge: token1={s1} token2={s2} raw1={raw1} raw2={raw2}")
+                    try:
+                        tx_hash = client.merge_positions(amount_to_merge, market, row['neg_risk'] == 'TRUE')
+                        print(f"Merged tx: {tx_hash}")
+                        # Reflect burned shares locally
+                        set_position(row['token1'], 'SELL', scaled_amt, 0, 'merge')
+                        set_position(row['token2'], 'SELL', scaled_amt, 0, 'merge')
+                    except Exception as ex:
+                        print(f"Merge failed: {ex}")
+                        # Do not adjust local positions on failure
                     
             # ------- TRADING LOGIC FOR EACH OUTCOME -------
             # Loop through both outcomes in the market (YES and NO)

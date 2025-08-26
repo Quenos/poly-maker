@@ -58,20 +58,19 @@ def select_rows(all_markets: pd.DataFrame, selected_questions: List[str]) -> pd.
     return matched
 
 
-def main() -> None:
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+def sync_selected_markets_to_stored() -> None:
     logger.info("Starting Selected->Stored Sel Markets sync")
-
+    
     spreadsheet = get_spreadsheet()
-
+    
     sel_df = read_sheet(spreadsheet, "Selected Markets")
     all_df = read_sheet(spreadsheet, "All Markets")
-
+    
     if sel_df.empty:
         logger.info("Selected Markets is empty; writing empty output")
         write_sheet(spreadsheet, "Stored Sel Markets", pd.DataFrame(columns=all_df.columns if not all_df.empty else []))
         return
-
+    
     # Prefer 'question' column; fallback to 'market' if present
     selected_questions: List[str] = []
     if "question" in sel_df.columns:
@@ -82,21 +81,26 @@ def main() -> None:
         logger.error("Selected Markets missing 'question' column; aborting")
         write_sheet(spreadsheet, "Stored Sel Markets", pd.DataFrame(columns=all_df.columns if not all_df.empty else []))
         return
-
+    
     matched_df = select_rows(all_df, selected_questions)
-
+    
     # Ensure identifier columns are written as strings (avoid scientific notation)
     if not matched_df.empty:
         for col in ["token1", "token2", "token_id", "condition_id"]:
             if col in matched_df.columns:
                 matched_df[col] = matched_df[col].astype(str)
-
+    
     # Preserve All Markets column order for consistency
     if not matched_df.empty and not all_df.empty:
         matched_df = matched_df.reindex(columns=all_df.columns, fill_value="")
-
+    
     write_sheet(spreadsheet, "Stored Sel Markets", matched_df)
     logger.info("Done")
+
+
+def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    sync_selected_markets_to_stored()
 
 
 if __name__ == "__main__":
