@@ -4,8 +4,94 @@ import os
 import requests
 import warnings
 import concurrent.futures
+import logging
+from types import SimpleNamespace
+import time
 
 warnings.filterwarnings("ignore")
+
+logger = logging.getLogger(__name__)
+def get_order_book_with_retry(client, token_id: str, max_attempts: int = 3, base_delay: float = 1):
+    """
+    Fetch order book with simple exponential backoff on rate limits.
+    Returns the book object on success, raises on final failure.
+    """
+    for attempt in range(1, max_attempts + 1):
+        try:
+            return client.get_order_book(token_id)
+        except Exception as ex:
+            message = str(ex)
+            is_last_attempt = attempt == max_attempts
+            if ("status_code=429" in message or "rate limit" in message.lower()) and not is_last_attempt:
+                sleep_seconds = base_delay * (2 ** (attempt - 1))
+                logger.warning(
+                    "Fetching order book for token=%s (attempt %s/%s) rate limited. Sleeping %.1fs",
+                    token_id,
+                    attempt,
+                    max_attempts,
+                    sleep_seconds,
+                )
+                time.sleep(sleep_seconds)
+                continue
+
+            logger.error(
+                "Fetching order book for token=%s failed on attempt %s/%s",
+                token_id,
+                attempt,
+                max_attempts,
+                exc_info=True,
+            )
+
+            if is_last_attempt:
+                raise
+
+def fetch_prices_history_with_retry(token_id: str, interval: str = '1m', fidelity: int = 10, max_attempts: int = 3, base_delay: float = 1):
+    """
+    Fetch prices history with simple exponential backoff on rate limits (429).
+    Returns the history list on success, raises on final failure.
+    """
+    url = f'https://clob.polymarket.com/prices-history?interval={interval}&market={token_id}&fidelity={fidelity}'
+    headers = {"Accept": "application/json"}
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.status_code == 200:
+                return resp.json().get('history', [])
+
+            is_last_attempt = attempt == max_attempts
+            body_text = resp.text or ''
+            if (resp.status_code == 429 or 'rate limited' in body_text.lower()) and not is_last_attempt:
+                sleep_seconds = base_delay * (2 ** (attempt - 1))
+                logger.warning(
+                    "Fetching price history for token=%s (attempt %s/%s) rate limited. Sleeping %.1fs",
+                    token_id,
+                    attempt,
+                    max_attempts,
+                    sleep_seconds,
+                )
+                time.sleep(sleep_seconds)
+                continue
+
+            logger.error(
+                "Fetching price history for token=%s failed with HTTP %s on attempt %s/%s",
+                token_id,
+                resp.status_code,
+                attempt,
+                max_attempts,
+            )
+            if is_last_attempt:
+                resp.raise_for_status()
+        except requests.RequestException:
+            is_last_attempt = attempt == max_attempts
+            logger.error(
+                "Fetching price history for token=%s errored on attempt %s/%s",
+                token_id,
+                attempt,
+                max_attempts,
+                exc_info=True,
+            )
+            if is_last_attempt:
+                raise
 
 
 if not os.path.exists('data'):
@@ -130,7 +216,17 @@ def process_single_row(row, client):
             break
 
     ret['rewards_daily_rate'] = rate
-    book = client.get_order_book(token1)
+    try:
+        book = get_order_book_with_retry(client, token1)
+    except Exception:
+        logger.error(
+            "Fetching order book for token=%s failed, question='%s', slug='%s'",
+            token1,
+            row.get('question', ''),
+            row.get('market_slug', ''),
+            exc_info=True,
+        )
+        book = SimpleNamespace(bids=[], asks=[])
     
     bids = pd.DataFrame()
     asks = pd.DataFrame()
@@ -220,7 +316,19 @@ def get_all_results(all_df, client, max_workers=5):
         try:
             return process_single_row(row, client)
         except:  # noqa: E722
-            print("error fetching market")
+            try:
+                tokens = row.get('tokens', [])
+                token_ids = [t.get('token_id') for t in tokens] if isinstance(tokens, list) else []
+            except Exception:
+                token_ids = []
+            logger.error(
+                "Error processing market at idx=%s, question='%s', slug='%s', tokens=%s",
+                idx,
+                row.get('question', ''),
+                row.get('market_slug', ''),
+                token_ids,
+                exc_info=True,
+            )
             return None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -232,7 +340,7 @@ def get_all_results(all_df, client, max_workers=5):
                 all_results.append(result)
 
             if len(all_results) % (max_workers * 2) == 0:
-                print(f'{len(all_results)} of {len(all_df)}')
+                logger.info('Fetched markets: %s of %s', len(all_results), len(all_df))
 
     return all_results
 
@@ -259,8 +367,19 @@ def calculate_annualized_volatility(df, hours):
     return round(annualized_volatility, 2)
 
 def add_volatility(row):
-    res = requests.get(f'https://clob.polymarket.com/prices-history?interval=1m&market={row["token1"]}&fidelity=10')
-    price_df = pd.DataFrame(res.json()['history'])
+    try:
+        history = fetch_prices_history_with_retry(row["token1"], interval='1m', fidelity=10)
+    except Exception:
+        logger.error(
+            "Fetching price history for token=%s failed, question='%s', slug='%s'",
+            row.get('token1', ''),
+            row.get('question', ''),
+            row.get('market_slug', ''),
+            exc_info=True,
+        )
+        history = []
+
+    price_df = pd.DataFrame(history)
     price_df['t'] = pd.to_datetime(price_df['t'], unit='s')
     price_df['p'] = price_df['p'].round(2)
 
@@ -270,17 +389,36 @@ def add_volatility(row):
 
     row_dict = row.copy()
 
-    stats = {
-        '1_hour': calculate_annualized_volatility(price_df, 1),
-        '3_hour': calculate_annualized_volatility(price_df, 3),
-        '6_hour': calculate_annualized_volatility(price_df, 6),
-        '12_hour': calculate_annualized_volatility(price_df, 12),
-        '24_hour': calculate_annualized_volatility(price_df, 24),
-        '7_day': calculate_annualized_volatility(price_df, 24 * 7),
-        '14_day': calculate_annualized_volatility(price_df, 24 * 14),
-        '30_day': calculate_annualized_volatility(price_df, 24 * 30),
-        'volatility_price': price_df['p'].iloc[-1]
-    }
+    stats = {}
+    try:
+        stats = {
+            '1_hour': calculate_annualized_volatility(price_df, 1),
+            '3_hour': calculate_annualized_volatility(price_df, 3),
+            '6_hour': calculate_annualized_volatility(price_df, 6),
+            '12_hour': calculate_annualized_volatility(price_df, 12),
+            '24_hour': calculate_annualized_volatility(price_df, 24),
+            '7_day': calculate_annualized_volatility(price_df, 24 * 7),
+            '14_day': calculate_annualized_volatility(price_df, 24 * 14),
+            '30_day': calculate_annualized_volatility(price_df, 24 * 30),
+            'volatility_price': price_df['p'].iloc[-1] if len(price_df) > 0 else 0
+        }
+    except Exception:
+        logger.error(
+            "Error computing volatility stats for token=%s",
+            row.get('token1', ''),
+            exc_info=True,
+        )
+        stats = {
+            '1_hour': 0,
+            '3_hour': 0,
+            '6_hour': 0,
+            '12_hour': 0,
+            '24_hour': 0,
+            '7_day': 0,
+            '14_day': 0,
+            '30_day': 0,
+            'volatility_price': 0,
+        }
 
     new_dict = {**row_dict, **stats}
     return new_dict
@@ -289,6 +427,7 @@ def add_volatility_to_df(df, max_workers=3):
     
     results = []
     df = df.reset_index(drop=True)
+    logger.info('Fetching volatility for %s markets', len(df))
 
     def process_volatility_with_progress(args):
         idx, row = args
@@ -296,7 +435,12 @@ def add_volatility_to_df(df, max_workers=3):
             ret = add_volatility(row.to_dict())
             return ret
         except:  # noqa: E722
-            print("Error fetching volatility")
+            logger.error(
+                "Fetching volatility failed for token=%s, question='%s'",
+                row.get('token1', ''),
+                row.get('question', ''),
+                exc_info=True,
+            )
             return None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -308,7 +452,7 @@ def add_volatility_to_df(df, max_workers=3):
                 results.append(result)
                 
             if len(results) % (max_workers * 2) == 0:
-                print(f'{len(results)} of {len(df)}')
+                logger.info('Fetching volatility: %s of %s', len(results), len(df))
             
     return pd.DataFrame(results)
 

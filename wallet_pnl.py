@@ -486,8 +486,8 @@ def main() -> None:
             side = "sell" if size > 0 else "buy"  # long -> sell to close, short -> buy to close
             best = get_best_price(token, side)
             pos_df.at[i, "best_price"] = best
-            # Unrealized is negative of liquidation value per request
-            pos_df.at[i, "Unrealized PnL"] = -(best * size)
+            # Unrealized PnL shall be positive (use absolute liquidation value)
+            pos_df.at[i, "Unrealized PnL"] = abs(best * size)
 
         if "yes_no" in summary.columns:
             summary = summary.merge(pos_df[["market", "yes_no", "Unrealized PnL"]], on=["market", "yes_no"], how="left")
@@ -507,7 +507,7 @@ def main() -> None:
             summary["Earnings"] = 0.0
         summary["Earnings"] = pd.to_numeric(summary.get("Earnings", 0.0), errors="coerce").fillna(0.0)
 
-        # PnL includes Realized, Unrealized and Earnings
+        # PnL for Position Summary: Realized + Unrealized + Earnings
         summary["Pnl"] = summary.get("Realized PnL", 0.0) + summary.get("Unrealized PnL", 0.0) + summary.get("Earnings", 0.0)
 
         # Preserve existing yes_no from grouping; only backfill if missing
