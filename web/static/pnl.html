@@ -1,0 +1,122 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Per-Trade PnL</title>
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="container">
+      <div class="header-row">
+        <h1>PnL Overview</h1>
+        <a class="pill" href="/">Back to Dashboard</a>
+      </div>
+
+      <section>
+        <h2>Totals</h2>
+        <div class="header-row">
+          <span id="total-pnl-pill" class="pill">Total: —</span>
+          <span id="realized-pill" class="pill">Realized: —</span>
+          <span id="unrealized-pill" class="pill">Unrealized: —</span>
+          <span id="earnings-pill" class="pill">Earnings: —</span>
+        </div>
+      </section>
+
+      <section>
+        <h2>Per Market</h2>
+        <table id="pnl-summary">
+          <thead>
+            <tr>
+              <th>Market</th>
+              <th>Outcome</th>
+              <th>Position</th>
+              <th>Realized</th>
+              <th>Unrealized</th>
+              <th>Earnings</th>
+              <th>PnL</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </section>
+    </div>
+
+    <script>
+      async function fetchJson(url) {
+        const res = await fetch(url, { cache: 'no-store' });
+        if (!res.ok) throw new Error('Request failed: ' + url);
+        return res.json();
+      }
+
+      function setRows(tbody, rows) {
+        tbody.innerHTML = '';
+        for (const row of rows) {
+          const tr = document.createElement('tr');
+          const cells = [
+            row['market'] || '',
+            row['yes/no'] || '',
+            formatNum(row['position_size']),
+            formatNum(row['realized']),
+            formatNum(row['unrealized']),
+            formatNum(row['earnings']),
+            formatNum(row['pnl'])
+          ];
+          for (const v of cells) {
+            const td = document.createElement('td');
+            td.textContent = v;
+            tr.appendChild(td);
+          }
+          tbody.appendChild(tr);
+        }
+      }
+
+      function formatNum(v) {
+        if (typeof v !== 'number') return v == null ? '' : String(v);
+        return Number.isFinite(v) ? v.toFixed(2) : '';
+      }
+
+      function setPills(data) {
+        const total = typeof data.total === 'number' ? data.total : 0;
+        const realized = typeof data.realized === 'number' ? data.realized : 0;
+        const unrealized = typeof data.unrealized === 'number' ? data.unrealized : 0;
+        const earnings = typeof data.earnings === 'number' ? data.earnings : 0;
+
+        const totalPill = document.getElementById('total-pnl-pill');
+        totalPill.textContent = `Total: ${total >= 0 ? '+' : ''}${total.toFixed(2)}`;
+        totalPill.classList.remove('green', 'red');
+        totalPill.classList.add(total >= 0 ? 'green' : 'red');
+
+        const rPill = document.getElementById('realized-pill');
+        rPill.textContent = `Realized: ${realized >= 0 ? '+' : ''}${realized.toFixed(2)}`;
+        rPill.classList.remove('green', 'red');
+        rPill.classList.add(realized >= 0 ? 'green' : 'red');
+
+        const uPill = document.getElementById('unrealized-pill');
+        uPill.textContent = `Unrealized: ${unrealized >= 0 ? '+' : ''}${unrealized.toFixed(2)}`;
+        uPill.classList.remove('green', 'red');
+        uPill.classList.add(unrealized >= 0 ? 'green' : 'red');
+
+        const ePill = document.getElementById('earnings-pill');
+        ePill.textContent = `Earnings: ${earnings >= 0 ? '+' : ''}${earnings.toFixed(2)}`;
+        ePill.classList.remove('green', 'red');
+        ePill.classList.add(earnings >= 0 ? 'green' : 'red');
+      }
+
+      async function refresh() {
+        try {
+          const data = await fetchJson('/api/pnl');
+          setPills(data || {});
+          setRows(document.querySelector('#pnl-summary tbody'), (data && data.rows) || []);
+        } catch (e) {
+          console.error(e);
+        }
+      }
+
+      refresh();
+      setInterval(refresh, 10000);
+    </script>
+  </body>
+  </html>
+
+

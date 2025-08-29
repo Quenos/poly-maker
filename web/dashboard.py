@@ -21,13 +21,17 @@ try:
 except Exception as exc:
     raise RuntimeError("poly_data package not found in workspace") from exc
 
-# Use existing trade fetcher from wallet_pnl
+# Use existing trade/PNL helpers from wallet_pnl
 try:
-    from wallet_pnl import fetch_activity_trades  # type: ignore
+    from wallet_pnl import (  # type: ignore
+        fetch_activity_trades,
+        fetch_reward_activities,
+        compute_earnings_by_market,
+        build_pnl_rows_from_activity,
+        get_best_price,
+    )
 except Exception as exc:
     raise RuntimeError("wallet_pnl.fetch_activity_trades not found") from exc
-
-
 load_dotenv()
 
 logger = logging.getLogger(__name__)
@@ -134,14 +138,7 @@ def _fetch_markets_metadata(
             try:
                 mid = str(m.get("id") or m.get("market") or m.get("conditionId") or "")
                 if mid:
-                    name = (
-                        m.get("question")
-                        or m.get("title")
-                        or m.get("name")
-                        or m.get("slug")
-                        or m.get("questionTitle")
-                        or ""
-                    )
+                    name = (m.get("question") or m.get("title") or m.get("name") or m.get("slug") or m.get("questionTitle") or "")
                     market_to_name[mid] = str(name)
                 for key in ("outcomes", "tokens", "outcomeTokens"):
                     if key in m and isinstance(m[key], list):
@@ -213,6 +210,14 @@ def index() -> FileResponse:
     index_path = os.path.join(STATIC_DIR, "index.html")
     if not os.path.exists(index_path):
         raise HTTPException(status_code=404, detail="index.html not found")
+    return FileResponse(index_path)
+
+
+@app.get("/pnl", include_in_schema=False)
+def pnl_page() -> FileResponse:
+    index_path = os.path.join(STATIC_DIR, "pnl.html")
+    if not os.path.exists(index_path):
+        raise HTTPException(status_code=404, detail="pnl.html not found")
     return FileResponse(index_path)
 
 
@@ -367,16 +372,221 @@ def get_recent_trades(limit: int = 10, page: int = 1) -> Dict[str, Any]:
         except Exception:
             p = 1
         try:
-            l = max(1, int(limit))
+            limit_num = max(1, int(limit))
         except Exception:
-            l = 10
-        start = (p - 1) * l
-        end = start + l
+            limit_num = 10
+        start = (p - 1) * limit_num
+        end = start + limit_num
         total = int(len(activity_df))
         records = _df_to_records(activity_df, wanted)[start:end]
-        return {"data": records, "page": p, "limit": l, "total": total}
+        return {"data": records, "page": p, "limit": limit_num, "total": total}
     except Exception as exc:
         logger.exception("Error fetching trades: %s", str(exc))
         raise HTTPException(status_code=500, detail="Failed to fetch trades")
 
 
+def _compute_current_pnl(wallet: str) -> Dict[str, Any]:
+    """Compute realized, unrealized, and total PnL grouped by market/outcome.
+
+    Returns a dict with keys: realized, unrealized, earnings, total, rows.
+    Each row contains: market, yes_no, position_size, realized, unrealized, earnings, pnl.
+    """
+    try:
+        activity_df = fetch_activity_trades(wallet, per_page_limit=500)
+    except Exception as exc:
+        logger.exception("Failed to fetch activity trades: %s", str(exc))
+        activity_df = None
+
+    try:
+        rewards_df = fetch_reward_activities(wallet, per_page_limit=500)
+    except Exception as exc:
+        logger.info("Failed to fetch reward activities: %s", str(exc))
+        rewards_df = None
+
+    if activity_df is None or getattr(activity_df, "empty", True):
+        return {
+            "realized": 0.0,
+            "unrealized": 0.0,
+            "earnings": 0.0,
+            "total": 0.0,
+            "rows": [],
+        }
+
+    try:
+        pnl_rows = build_pnl_rows_from_activity(activity_df)
+    except Exception as exc:
+        logger.exception("Failed to map activity to PnL rows: %s", str(exc))
+        pnl_rows = None
+
+    if pnl_rows is None or getattr(pnl_rows, "empty", True):
+        return {
+            "realized": 0.0,
+            "unrealized": 0.0,
+            "earnings": 0.0,
+            "total": 0.0,
+            "rows": [],
+        }
+
+    # Ensure needed columns and types
+    try:
+        pnl_rows["shares"] = pd.to_numeric(pnl_rows.get("shares", 0), errors="coerce").fillna(0.0)
+        pnl_rows["price"] = pd.to_numeric(pnl_rows.get("price", 0), errors="coerce").fillna(0.0)
+    except Exception:
+        pass
+
+    # Group keys
+    group_keys: List[str] = ["market"]
+    if "yes/no" in pnl_rows.columns:
+        group_keys.append("yes/no")
+
+    # Position size and realized pnl (cash flow sum)
+    summary = (
+        pnl_rows.groupby(group_keys, dropna=False)[["shares", "price"]]
+        .sum()
+        .reset_index()
+        .rename(columns={"shares": "position_size", "price": "realized"})
+    )
+
+    # Map group -> representative token_id via latest row
+    try:
+        pnl_rows["date_ts"] = pd.to_datetime(pnl_rows.get("date"), errors="coerce").astype("int64") // 10**9
+        latest_by_key = pnl_rows.sort_values("date_ts").groupby(group_keys).tail(1)
+    except Exception:
+        latest_by_key = pnl_rows.groupby(group_keys).tail(1)
+
+    token_map: Dict[Tuple[str, str], str] = {}
+    use_two_keys = len(group_keys) == 2
+    for _, r in latest_by_key.iterrows():
+        m = str(r.get("market", ""))
+        y = str(r.get("yes/no", "")) if use_two_keys else ""
+        tok = str(r.get("token_id", ""))
+        if m and tok:
+            token_map[(m, y)] = tok
+
+    # Compute unrealized using best price for closing side
+    summary["unrealized"] = 0.0
+    for idx, row in summary.iterrows():
+        m = str(row.get("market", ""))
+        y = str(row.get("yes/no", "")) if use_two_keys else ""
+        size = float(row.get("position_size", 0.0) or 0.0)
+        tok = token_map.get((m, y))
+        if not tok or size == 0.0:
+            continue
+        side = "sell" if size > 0 else "buy"
+        try:
+            best = get_best_price(tok, side)
+        except Exception:
+            best = 0.0
+        summary.at[idx, "unrealized"] = abs(best * size)
+
+    # Earnings (rewards) by market title
+    try:
+        earnings_df = compute_earnings_by_market(rewards_df) if rewards_df is not None else pd.DataFrame()
+    except Exception:
+        earnings_df = pd.DataFrame()
+    if not earnings_df.empty:
+        summary = summary.merge(earnings_df.rename(columns={"Earnings": "earnings"}), on="market", how="left")
+    if "earnings" not in summary.columns:
+        summary["earnings"] = 0.0
+
+    # Total per row and totals
+    summary["pnl"] = sum([
+        pd.to_numeric(summary.get("realized", 0.0), errors="coerce").fillna(0.0),
+        pd.to_numeric(summary.get("unrealized", 0.0), errors="coerce").fillna(0.0),
+        pd.to_numeric(summary.get("earnings", 0.0), errors="coerce").fillna(0.0),
+    ])
+
+    realized_total = float(pd.to_numeric(summary.get("realized", 0.0), errors="coerce").fillna(0.0).sum())
+    unrealized_total = float(pd.to_numeric(summary.get("unrealized", 0.0), errors="coerce").fillna(0.0).sum())
+    earnings_total = float(pd.to_numeric(summary.get("earnings", 0.0), errors="coerce").fillna(0.0).sum())
+    total = float(pd.to_numeric(summary.get("pnl", 0.0), errors="coerce").fillna(0.0).sum())
+
+    # Prepare rows for JSON
+    fields = ["market", "position_size", "realized", "unrealized", "earnings", "pnl"]
+    if use_two_keys:
+        fields.insert(1, "yes/no")
+    rows = _df_to_records(summary, fields)
+
+    return {
+        "realized": realized_total,
+        "unrealized": unrealized_total,
+        "earnings": earnings_total,
+        "total": total,
+        "rows": rows,
+    }
+
+
+@app.get("/api/pnl")
+def get_pnl() -> Dict[str, Any]:
+    wallet = (os.getenv("BROWSER_WALLET") or os.getenv("BROWSER_ADDRESS") or "").strip()
+    if not wallet:
+        raise HTTPException(status_code=400, detail="BROWSER_WALLET/BROWSER_ADDRESS not configured")
+    try:
+        result = _compute_current_pnl(wallet)
+        return result
+    except Exception as exc:
+        logger.exception("Error computing PnL: %s", str(exc))
+        raise HTTPException(status_code=500, detail="Failed to compute PnL")
+
+
+@app.get("/api/pnl/trades")
+def get_pnl_trades(limit: int = 100, page: int = 1) -> Dict[str, Any]:
+    """Return per-trade cash flows derived from activity for PnL accounting."""
+    wallet = (os.getenv("BROWSER_WALLET") or os.getenv("BROWSER_ADDRESS") or "").strip()
+    if not wallet:
+        raise HTTPException(status_code=400, detail="BROWSER_WALLET/BROWSER_ADDRESS not configured")
+    try:
+        activity_df = fetch_activity_trades(wallet, per_page_limit=max(100, int(limit)))
+        if activity_df is None or activity_df.empty:
+            return {"data": [], "page": 1, "limit": limit, "total": 0}
+
+        pnl_rows = build_pnl_rows_from_activity(activity_df)
+        if pnl_rows is None or pnl_rows.empty:
+            return {"data": [], "page": 1, "limit": limit, "total": 0}
+
+        # Prepare fields and formatting
+        try:
+            pnl_rows["date"] = pd.to_datetime(pnl_rows.get("date"), errors="coerce")
+            pnl_rows["datetime"] = pnl_rows["date"].dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            pnl_rows["datetime"] = ""
+
+        pnl_rows = pnl_rows.rename(columns={"yes/no": "outcome"}).fillna({"outcome": ""})
+
+        wanted_cols = [
+            "market",
+            "outcome",
+            "side",
+            "shares",
+            "open_price",
+            "price",  # cash flow (+sell, -buy)
+            "datetime",
+        ]
+
+        # Sort newest first
+        try:
+            pnl_rows = pnl_rows.sort_values("date", ascending=False)
+        except Exception:
+            pass
+
+        # Pagination
+        try:
+            page_num = max(1, int(page))
+        except Exception:
+            page_num = 1
+        try:
+            limit_num = max(1, int(limit))
+        except Exception:
+            limit_num = 100
+        start = (page_num - 1) * limit_num
+        end = start + limit_num
+        total = int(len(pnl_rows))
+        records = _df_to_records(pnl_rows, wanted_cols)[start:end]
+        # Rename price -> cash_flow for clarity in API response
+        for r in records:
+            if "price" in r:
+                r["cash_flow"] = r.pop("price")
+        return {"data": records, "page": page_num, "limit": limit_num, "total": total}
+    except Exception as exc:
+        logger.exception("Error fetching per-trade PnL: %s", str(exc))
+        raise HTTPException(status_code=500, detail="Failed to fetch per-trade PnL")

@@ -11,6 +11,8 @@ import time
 warnings.filterwarnings("ignore")
 
 logger = logging.getLogger(__name__)
+# Gate saving of per-token time series CSVs via env flag
+_SAVE_PRICE_HISTORY_CSV = str(os.getenv("SAVE_PRICE_HISTORY_CSV", "")).strip().lower() in ("1", "true", "yes", "on")
 def get_order_book_with_retry(client, token_id: str, max_attempts: int = 3, base_delay: float = 1):
     """
     Fetch order book with simple exponential backoff on rate limits.
@@ -383,7 +385,15 @@ def add_volatility(row):
     price_df['t'] = pd.to_datetime(price_df['t'], unit='s')
     price_df['p'] = price_df['p'].round(2)
 
-    price_df.to_csv(f'data/{row["token1"]}.csv', index=False)
+    # Optionally save per-token price history CSVs for offline analysis
+    if _SAVE_PRICE_HISTORY_CSV:
+        try:
+            price_df.to_csv(f'data/{row["token1"]}.csv', index=False)
+            logger.info("Saved price history CSV for token=%s (rows=%d)", row.get("token1", ""), len(price_df.index))
+        except Exception:
+            logger.debug("Failed to save price history CSV for token=%s", row.get("token1", ""), exc_info=True)
+    else:
+        logger.debug("Skipping save of price history CSV for token=%s (disabled)", row.get("token1", ""))
     
     price_df['log_return'] = np.log(price_df['p'] / price_df['p'].shift(1))
 

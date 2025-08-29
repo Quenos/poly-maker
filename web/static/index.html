@@ -8,7 +8,10 @@
   </head>
   <body>
     <div class="container">
-      <h1>Poly Maker Dashboard</h1>
+      <div class="header-row">
+        <h1>Poly Maker Dashboard</h1>
+        <a id="total-pnl" class="pill" href="/pnl" title="View per-trade PnL">PnL: —</a>
+      </div>
 
       <section>
         <h2>Open Orders</h2>
@@ -137,10 +140,11 @@
 
       async function refresh() {
         try {
-          const [orders, positions, trades] = await Promise.all([
+          const [orders, positions, trades, pnl] = await Promise.all([
             fetchJson('/api/orders'),
             fetchJson('/api/positions'),
             fetchJson(`/api/trades?limit=${tradesPerPage}&page=${tradePage}`),
+            fetchJson('/api/pnl'),
           ]);
 
           setRows(document.querySelector('#orders tbody'), orders.data || [], [
@@ -156,6 +160,14 @@
           ]);
           const totalPages = trades.total ? Math.max(1, Math.ceil(trades.total / tradesPerPage)) : 1;
           renderPagination(totalPages);
+
+          // Update header PnL pill
+          const pill = document.getElementById('total-pnl');
+          const total = pnl && typeof pnl.total === 'number' ? pnl.total : 0;
+          const sign = total > 0 ? '+' : '';
+          pill.textContent = `PnL: ${sign}${total.toFixed(2)}`;
+          pill.classList.remove('green', 'red');
+          pill.classList.add(total >= 0 ? 'green' : 'red');
         } catch (e) {
           console.error(e);
         }
