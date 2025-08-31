@@ -109,22 +109,28 @@ async def login(request: Request):
 
 @app.get("/auth/callback", include_in_schema=False, name="auth_callback")
 async def auth_callback(request: Request):
+    # exchange code for token
     token = await oauth.github.authorize_access_token(request)
-    userinfo = token.get("userinfo")
-    # Fallback if GitHub OIDC userinfo not present:
-    if not userinfo:
-        async with oauth.github.client as client:
-            resp = await client.get("https://api.github.com/user", headers={"Accept": "application/vnd.github+json"})
-            resp.raise_for_status()
-            userinfo = resp.json()
-    # Store only what you need
+
+    # fetch the user profile using the provider directly
+    resp = await oauth.github.get("user", token=token)
+    resp.raise_for_status()
+    u = resp.json()
+
+    # (optional) email fetch if you need it:
+    # emails = await oauth.github.get("user/emails", token=token)
+    # primary_email = next((e["email"] for e in emails.json() if e.get("primary")), None)
+
+    # store a small session
     request.session["user"] = {
-        "id": userinfo.get("id"),
-        "login": userinfo.get("login"),
-        "name": userinfo.get("name") or userinfo.get("login"),
-        "avatar_url": userinfo.get("avatar_url"),
+        "id": u.get("id"),
+        "login": u.get("login"),
+        "name": u.get("name") or u.get("login"),
+        "avatar_url": u.get("avatar_url"),
+        # "email": primary_email,
     }
-    # Go back to dashboard or ?next=
+
+    # send the user back
     next_url = request.query_params.get("next") or f"{request.app.root_path}/"
     return RedirectResponse(next_url)
 
