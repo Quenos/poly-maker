@@ -1,4 +1,5 @@
 import time
+import argparse
 import pandas as pd
 from data_updater.trading_utils import get_clob_client
 from data_updater.google_utils import get_spreadsheet
@@ -61,12 +62,7 @@ def sort_df(df):
     df['ask_score'] = df['best_ask'].apply(proximity_score)
     
     # Create a composite score (higher is better for rewards, lower is better for volatility, with proximity scores)
-    df['composite_score'] = (
-        df['std_gm_reward_per_100'] - 
-        df['std_volatility_sum'] + 
-        df['bid_score'] + 
-        df['ask_score']
-    )
+    df['composite_score'] = df['std_gm_reward_per_100'] - df['std_volatility_sum'] + df['bid_score'] + df['ask_score']
     
     # Sort by the composite score in descending order
     sorted_df = df.sort_values(by='composite_score', ascending=False)
@@ -120,15 +116,29 @@ def fetch_and_process_data():
     else:
         print(f'{pd.to_datetime("now")}: Not updating sheet because of length {len(new_df)}.')
 
+def run_cycle():
+    try:
+        # Save the entries in all markets data drom selected markets to stored markets
+        sync_selected_markets_to_stored()
+        fetch_and_process_data()
+        # append missing rows from selected markets to all markets
+        append_missing_rows()
+    except Exception as e:
+        traceback.print_exc()
+        print(str(e))
+
 if __name__ == "__main__":
-    while True:
-        try:
-            # Save the entries in all markets data drom selected markets to stored markets
-            sync_selected_markets_to_stored()
-            fetch_and_process_data()
-            # append missing rows from selected markets to all markets
-            append_missing_rows()
+    parser = argparse.ArgumentParser(description="Update Polymarket markets and Google Sheets")
+    parser.add_argument(
+        "--crontab",
+        action="store_true",
+        help="Run a single cycle and exit (intended for use with crontab)",
+    )
+    args = parser.parse_args()
+
+    if args.crontab:
+        run_cycle()
+    else:
+        while True:
+            run_cycle()
             time.sleep(60 * 60)  # Sleep for an hour
-        except Exception as e:
-            traceback.print_exc()
-            print(str(e))
