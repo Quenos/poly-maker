@@ -72,7 +72,7 @@ def sort_df(df):
     
     return sorted_df
 
-def fetch_and_process_data():
+def fetch_and_process_data(api_delay: float = 2.0):
     global spreadsheet, client, wk_all, wk_vol, sel_df
     
     spreadsheet = get_spreadsheet()
@@ -85,13 +85,13 @@ def fetch_and_process_data():
     sel_df = get_sel_df(spreadsheet, "Selected Markets")
     all_df = get_all_markets(client)
     print("Got all Markets")
-    all_results = get_all_results(all_df, client)
+    all_results = get_all_results(all_df, client, base_delay=api_delay)
     print("Got all Results")
     m_data, all_markets = get_markets(all_results, sel_df, maker_reward=0.75)
     print("Got all orderbook")
 
     print(f'{pd.to_datetime("now")}: Fetched all markets data of length {len(all_markets)}.')
-    new_df = add_volatility_to_df(all_markets)
+    new_df = add_volatility_to_df(all_markets, base_delay=api_delay)
     new_df['volatility_sum'] = new_df['24_hour'] + new_df['7_day'] + new_df['14_day']
 
     new_df = new_df.sort_values('volatility_sum', ascending=True)
@@ -116,11 +116,11 @@ def fetch_and_process_data():
     else:
         print(f'{pd.to_datetime("now")}: Not updating sheet because of length {len(new_df)}.')
 
-def run_cycle():
+def run_cycle(api_delay: float = 2.0):
     try:
         # Save the entries in all markets data drom selected markets to stored markets
         sync_selected_markets_to_stored()
-        fetch_and_process_data()
+        fetch_and_process_data(api_delay=api_delay)
         # append missing rows from selected markets to all markets
         append_missing_rows()
     except Exception as e:
@@ -134,11 +134,17 @@ if __name__ == "__main__":
         action="store_true",
         help="Run a single cycle and exit (intended for use with crontab)",
     )
+    parser.add_argument(
+        "--api-delay",
+        type=float,
+        default=2.0,
+        help="Base delay in seconds between API retries and pacing (default: 2.0)",
+    )
     args = parser.parse_args()
 
     if args.crontab:
-        run_cycle()
+        run_cycle(api_delay=args.api_delay)
     else:
         while True:
-            run_cycle()
+            run_cycle(api_delay=args.api_delay)
             time.sleep(60 * 60)  # Sleep for an hour

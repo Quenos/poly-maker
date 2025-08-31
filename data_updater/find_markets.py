@@ -197,7 +197,7 @@ def add_formula_params(curr_df, midpoint, v, daily_reward):
     curr_df['reward_per_100'] = (curr_df['Q'] / curr_df['Q'].sum()) * daily_reward / 2 / curr_df['size'] * curr_df['100']
     return curr_df
 
-def process_single_row(row, client):
+def process_single_row(row, client, base_delay: float = 1):
     ret = {}
     ret['question'] = row['question']
     ret['neg_risk'] = row['neg_risk']
@@ -219,7 +219,7 @@ def process_single_row(row, client):
 
     ret['rewards_daily_rate'] = rate
     try:
-        book = get_order_book_with_retry(client, token1)
+        book = get_order_book_with_retry(client, token1, base_delay=base_delay)
     except Exception:
         logger.error(
             "Fetching order book for token=%s failed, question='%s', slug='%s'",
@@ -310,13 +310,13 @@ def process_single_row(row, client):
     return ret
 
 
-def get_all_results(all_df, client, max_workers=5):
+def get_all_results(all_df, client, max_workers: int = 5, base_delay: float = 1):
     all_results = []
 
     def process_with_progress(args):
         idx, row = args
         try:
-            return process_single_row(row, client)
+            return process_single_row(row, client, base_delay=base_delay)
         except:  # noqa: E722
             try:
                 tokens = row.get('tokens', [])
@@ -368,9 +368,9 @@ def calculate_annualized_volatility(df, hours):
     annualized_volatility = volatility * np.sqrt(60 * 24 * 252)
     return round(annualized_volatility, 2)
 
-def add_volatility(row):
+def add_volatility(row, base_delay: float = 1):
     try:
-        history = fetch_prices_history_with_retry(row["token1"], interval='1m', fidelity=10)
+        history = fetch_prices_history_with_retry(row["token1"], interval='1m', fidelity=10, base_delay=base_delay)
     except Exception:
         logger.error(
             "Fetching price history for token=%s failed, question='%s', slug='%s'",
@@ -433,7 +433,7 @@ def add_volatility(row):
     new_dict = {**row_dict, **stats}
     return new_dict
 
-def add_volatility_to_df(df, max_workers=3):
+def add_volatility_to_df(df, max_workers: int = 3, base_delay: float = 1):
     
     results = []
     df = df.reset_index(drop=True)
@@ -442,7 +442,7 @@ def add_volatility_to_df(df, max_workers=3):
     def process_volatility_with_progress(args):
         idx, row = args
         try:
-            ret = add_volatility(row.to_dict())
+            ret = add_volatility(row.to_dict(), base_delay=base_delay)
             return ret
         except:  # noqa: E722
             logger.error(
