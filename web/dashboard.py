@@ -25,6 +25,11 @@ try:
 except Exception as exc:
     raise RuntimeError("poly_data package not found in workspace") from exc
 
+def _csv_env_set(name: str) -> set[str]:
+    return set(x.strip() for x in (os.getenv(name, "") or "").split(",") if x.strip())
+
+ALLOWED_GH_IDS = _csv_env_set("ALLOWED_GH_IDS")
+
 # Use existing trade/PNL helpers from wallet_pnl
 try:
     from wallet_pnl import (  # type: ignore
@@ -97,9 +102,11 @@ oauth.register(
 def require_user(req: Request):
     user = req.session.get("user")
     if not user:
-        # send them to login, preserving where they wanted to go
         next_url = req.url.path
         raise HTTPException(status_code=307, headers={"Location": f"{req.app.root_path}/login?next={next_url}"})
+    if ALLOWED_GH_IDS and str(user.get("id", "")) not in ALLOWED_GH_IDS:
+        req.session.clear()
+        raise HTTPException(status_code=403, detail="Not authorized")
     return user
 
 @app.get("/login", include_in_schema=False)
@@ -109,30 +116,28 @@ async def login(request: Request):
 
 @app.get("/auth/callback", include_in_schema=False, name="auth_callback")
 async def auth_callback(request: Request):
-    # exchange code for token
     token = await oauth.github.authorize_access_token(request)
-
-    # fetch the user profile using the provider directly
     resp = await oauth.github.get("user", token=token)
     resp.raise_for_status()
     u = resp.json()
 
-    # (optional) email fetch if you need it:
-    # emails = await oauth.github.get("user/emails", token=token)
-    # primary_email = next((e["email"] for e in emails.json() if e.get("primary")), None)
+    gh_id = str(u.get("id", ""))
 
-    # store a small session
+    # >>> ADD THIS BLOCK <<<
+    if ALLOWED_GH_IDS and gh_id not in ALLOWED_GH_IDS:
+        request.session.clear()
+        raise HTTPException(status_code=403, detail="Not authorized")
+    # <<< END ADD >>>
+
     request.session["user"] = {
-        "id": u.get("id"),
+        "id": gh_id,
         "login": u.get("login"),
         "name": u.get("name") or u.get("login"),
         "avatar_url": u.get("avatar_url"),
-        # "email": primary_email,
     }
-
-    # send the user back
     next_url = request.query_params.get("next") or f"{request.app.root_path}/"
     return RedirectResponse(next_url)
+
 
 @app.get("/logout", include_in_schema=False)
 def logout(request: Request):
