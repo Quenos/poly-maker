@@ -3,10 +3,11 @@ import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, RedirectResponse
 from starlette.staticfiles import StaticFiles
 from dotenv import load_dotenv
 import requests
+import sqlite3
 
 try:
     import pandas as pd  # type: ignore
@@ -219,6 +220,94 @@ def pnl_page() -> FileResponse:
     if not os.path.exists(index_path):
         raise HTTPException(status_code=404, detail="pnl.html not found")
     return FileResponse(index_path)
+
+
+def _get_db_path() -> str:
+    """Return path to odds SQLite DB with env override."""
+    try:
+        env_path = (os.getenv("ODDS_DB_PATH") or "").strip()
+        if env_path:
+            return env_path
+    except Exception:
+        pass
+    root_dir = os.path.dirname(os.path.dirname(__file__))
+    return os.path.join(root_dir, "data", "odds.db")
+
+
+def _query_db(sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
+    db_path = _get_db_path()
+    if not os.path.exists(db_path):
+        logger.warning("SQLite DB not found at %s", db_path)
+        return []
+    try:
+        conn = sqlite3.connect(db_path)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(sql, params)
+        rows = [dict(row) for row in cur.fetchall()]
+        conn.close()
+        return rows
+    except Exception as exc:
+        logger.exception("DB query failed: %s", str(exc))
+        return []
+
+
+@app.get("/odds", include_in_schema=False)
+def odds_page() -> RedirectResponse:
+    return RedirectResponse(url="/static/odds.html")
+
+
+@app.get("/odds/", include_in_schema=False)
+def odds_page_slash() -> RedirectResponse:
+    return RedirectResponse(url="/static/odds.html")
+
+
+@app.get("/odds.html", include_in_schema=False)
+def odds_page_html() -> RedirectResponse:
+    return RedirectResponse(url="/static/odds.html")
+
+
+@app.get("/api/odds")
+def get_odds(limit: Optional[int] = None) -> Dict[str, Any]:
+    """Return markets with p_model and hourly p_actuals for both tokens (and yes/no when available)."""
+    markets = _query_db(
+        "SELECT question, title, category, token1, token2, p_model, confidence FROM markets"
+    )
+    if not markets:
+        return {"data": []}
+
+    out: List[Dict[str, Any]] = []
+    for m in markets:
+        token1 = str(m.get("token1", "") or "")
+        token2 = str(m.get("token2", "") or "")
+        if not token1 and not token2:
+            snapshots: List[Dict[str, Any]] = []
+        else:
+            if limit is not None and limit > 0:
+                sql = (
+                    "SELECT ts_utc, p_token1, p_token2, p_yes, p_no FROM market_prices_hourly "
+                    "WHERE token1 = ? AND token2 = ? ORDER BY ts_utc DESC LIMIT ?"
+                )
+                rows = _query_db(sql, (token1, token2, int(limit)))
+            else:
+                sql = (
+                    "SELECT ts_utc, p_token1, p_token2, p_yes, p_no FROM market_prices_hourly "
+                    "WHERE token1 = ? AND token2 = ? ORDER BY ts_utc DESC"
+                )
+                rows = _query_db(sql, (token1, token2))
+            snapshots = rows or []
+
+        out.append({
+            "market": (m.get("question") or m.get("title") or ""),
+            "category": m.get("category"),
+            "p_model": m.get("p_model"),
+            "confidence": m.get("confidence"),
+            "token1": token1,
+            "token2": token2,
+            "snapshots": snapshots,
+        })
+
+    return {"data": out}
 
 
 @app.get("/api/orders")

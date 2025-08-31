@@ -551,8 +551,13 @@ def _configure_logging_for_run(log_dir: str = LOG_DIR_DEFAULT, base_name: str = 
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)
 
-    # Allow all messages to reach handlers; handlers control filtering
-    root_logger.setLevel(logging.DEBUG)
+    # Set root level from env (default INFO) to avoid overly verbose logs
+    try:
+        root_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+        root_level = getattr(logging, root_level_name, logging.INFO)
+    except Exception:
+        root_level = logging.INFO
+    root_logger.setLevel(root_level)
 
     # Exclude noisy libraries
     try:
@@ -568,7 +573,7 @@ def _configure_logging_for_run(log_dir: str = LOG_DIR_DEFAULT, base_name: str = 
             logger.removeHandler(h)
     except Exception:
         pass
-    logger.setLevel(logging.DEBUG)
+    logger.setLevel(root_logger.level)
     logger.propagate = True
 
     # Prune old log files
@@ -775,7 +780,6 @@ def compute_edge_for_markets(pairs_df: pd.DataFrame,
         events = _extract_titles_only(pairs_df)
         if not events:
             return []
-        logger.info("Odds: prepared %d events; chunk_size=%d", len(events), chunk_size)
 
         def _extract_queries_from_ai_response(text: str) -> list[str]:
             """Extract probable Tavily queries from AI free-text or JSON-like content."""
@@ -886,20 +890,10 @@ def compute_edge_for_markets(pairs_df: pd.DataFrame,
         ]
 
         def process_chunk(chunk_index: int, chunk_events: list[dict]) -> list[dict]:
-            logger.info("Chunk %s: start; events=%d", chunk_index, len(chunk_events))
+            logger.debug("Chunk %s: start; events=%d", chunk_index, len(chunk_events))
             system_prompt = EDGE_SYSTEM_PROMPT
             user_prompt = _build_edge_user_prompt(chunk_events)
-            try:
-                preview = [
-                    {
-                        "title": (e.get("title", "") or "")[:140],
-                        "description": (e.get("rules", "") or "")[:280],
-                    }
-                    for e in chunk_events[:3]
-                ]
-                logger.info("Chunk %s: event preview (with descriptions): %s", chunk_index, preview)
-            except Exception:
-                logger.debug("Chunk %s: failed to build preview for descriptions", chunk_index, exc_info=True)
+            # Keep logs light; skip noisy previews
             api_key = os.getenv("OPENAI_API_KEY", "").strip()
             client_local = OpenAI(api_key=api_key) if api_key else OpenAI()
             stats = ChunkStats()
@@ -944,7 +938,6 @@ def compute_edge_for_markets(pairs_df: pd.DataFrame,
             ]
 
             try:
-                logger.info("Chunk %s: sending initial completion request", chunk_index)
                 resp = client_local.chat.completions.create(
                     model=model,
                     messages=messages,
@@ -953,7 +946,7 @@ def compute_edge_for_markets(pairs_df: pd.DataFrame,
                     response_format=RESPONSE_FORMAT,
                 )
             except Exception:
-                logger.exception("Odds OpenAI initial request failed for chunk %s; skipping", chunk_index)
+                logger.warning("OpenAI initial request failed for chunk %s; skipping", chunk_index)
                 return []
 
             # Allow more tool-call steps; configurable via env
@@ -982,17 +975,7 @@ def compute_edge_for_markets(pairs_df: pd.DataFrame,
                 finish = getattr(choice, "finish_reason", None)
                 tool_calls = getattr(choice.message, "tool_calls", None)
                 content = (choice.message.content or "").strip() if getattr(choice, "message", None) else ""
-                try:
-                    logger.info(
-                        "Chunk %s: step=%d finish=%s tool_calls=%d content_len=%d",
-                        chunk_index,
-                        steps,
-                        str(finish),
-                        len(tool_calls or []),
-                        len(content),
-                    )
-                except Exception:
-                    pass
+                logger.debug("Chunk %s: step=%d finish=%s tool_calls=%d content_len=%d", chunk_index, steps, str(finish), len(tool_calls or []), len(content))
 
                 if finish == "stop" and not tool_calls:
                     break
@@ -1019,7 +1002,7 @@ def compute_edge_for_markets(pairs_df: pd.DataFrame,
                                         stats.record_error(None, query, "search")
                                 except Exception as exc:
                                     status = _extract_http_status(exc)
-                                    logger.warning("tavily_search_impl error: chunk=%s status=%s query=%r", chunk_index, status, query)
+                                    logger.debug("tavily_search_impl error: chunk=%s status=%s query=%r", chunk_index, status, query)
                                     stats.record_error(status, query, "search")
                                     results = {"results": [], "meta": {"query": query}}
                             else:
@@ -1042,7 +1025,7 @@ def compute_edge_for_markets(pairs_df: pd.DataFrame,
                                         stats.record_success()
                                 except Exception as exc:
                                     status = _extract_http_status(exc)
-                                    logger.warning("tavily_get_impl error: chunk=%s status=%s url=%s", chunk_index, status, url)
+                                    logger.debug("tavily_get_impl error: chunk=%s status=%s url=%s", chunk_index, status, url)
                                     stats.record_error(status, url, "get")
                                     page = {"url": url, "title": None, "text": None, "length": 0}
                             else:
@@ -1058,7 +1041,7 @@ def compute_edge_for_markets(pairs_df: pd.DataFrame,
                             })
 
                     try:
-                        logger.info("Chunk %s: sending follow-up completion (post tool results)", chunk_index)
+                        logger.debug("Chunk %s: sending follow-up completion (post tool results)", chunk_index)
                         resp = client_local.chat.completions.create(
                             model=model,
                             messages=messages,
@@ -1073,7 +1056,7 @@ def compute_edge_for_markets(pairs_df: pd.DataFrame,
                             try:
                                 salvage_attempted = True
                                 titles = [e.get("title", "") for e in chunk_events]
-                                logger.info("Chunk %s: running salvage pass", chunk_index)
+                                logger.debug("Chunk %s: running salvage pass", chunk_index)
                                 salvage_resp = client_local.chat.completions.create(
                                     model=model,
                                     messages=[{"role": "system", "content": SALVAGE_SYSTEM}, {"role": "user", "content": salvage_user_prompt(titles)}],
@@ -1123,7 +1106,7 @@ def compute_edge_for_markets(pairs_df: pd.DataFrame,
                                 logger.debug("Chunk %s: salvage pass failed", chunk_index, exc_info=True)
 
                         if elapsed >= max_seconds:
-                            logger.info("Time budget exceeded for chunk %s after %ss; asking for final JSON", chunk_index, int(elapsed))
+                            logger.debug("Time budget exceeded for chunk %s after %ss; asking for final JSON", chunk_index, int(elapsed))
                             try:
                                 messages.append({"role": "user", "content": "Time limit reached. Please return ONLY:\n{ \"results\": [ ...objects per the system spec... ] }"})
                                 resp = client_local.chat.completions.create(
@@ -1147,33 +1130,20 @@ def compute_edge_for_markets(pairs_df: pd.DataFrame,
                 if content:
                     parsed = json.loads(content)
                     if isinstance(parsed, dict) and isinstance(parsed.get("results"), list):
-                        try:
-                            logger.info("Chunk %s: final JSON object content: %s", chunk_index, content)
-                        except Exception:
-                            pass
-                        logger.info("Chunk %s: parsed results array (%d items)", chunk_index, len(parsed["results"]))
+                        logger.debug("Chunk %s: parsed results array (%d items)", chunk_index, len(parsed["results"]))
                         return parsed["results"]
                     if isinstance(parsed, list):
-                        try:
-                            logger.info("Chunk %s: final JSON array content: %s", chunk_index, content)
-                        except Exception:
-                            pass
-                        logger.info("Chunk %s: parsed final JSON array (%d items)", chunk_index, len(parsed))
+                        logger.debug("Chunk %s: parsed final JSON array (%d items)", chunk_index, len(parsed))
                         return parsed
                     start = content.find("[")
                     end = content.rfind("]")
                     if start != -1 and end != -1 and end > start:
                         parsed = json.loads(content[start:end + 1])
-                        try:
-                            logger.info("Chunk %s: final bracketed JSON content: %s", chunk_index, content)
-                        except Exception:
-                            pass
-                        logger.info("Chunk %s: parsed bracketed JSON array (%d items)", chunk_index, len(parsed) if isinstance(parsed, list) else 0)
+                        logger.debug("Chunk %s: parsed bracketed JSON array (%d items)", chunk_index, len(parsed) if isinstance(parsed, list) else 0)
                         return parsed if isinstance(parsed, list) else []
                 # One more attempt: explicitly request final JSON only
                 messages.append({"role": "user", "content": "Please return ONLY:\n{ \"results\": [ ...objects per the system spec... ] }"})
                 try:
-                    logger.info("Chunk %s: requesting final JSON-only response", chunk_index)
                     resp2 = client_local.chat.completions.create(
                         model=model,
                         messages=messages,
@@ -1182,22 +1152,18 @@ def compute_edge_for_markets(pairs_df: pd.DataFrame,
                         response_format=RESPONSE_FORMAT,
                     )
                     final_text = (resp2.choices[0].message.content or "").strip()
-                    try:
-                        logger.info("Chunk %s: final JSON-only text: %s", chunk_index, final_text)
-                    except Exception:
-                        pass
                     parsed2 = json.loads(final_text)
                     if isinstance(parsed2, dict) and isinstance(parsed2.get("results"), list):
-                        logger.info("Chunk %s: parsed final JSON-only results array (%d items)", chunk_index, len(parsed2["results"]))
+                        logger.debug("Chunk %s: parsed final JSON-only results array (%d items)", chunk_index, len(parsed2["results"]))
                         return parsed2["results"]
                     if isinstance(parsed2, list):
-                        logger.info("Chunk %s: parsed final JSON-only array (%d items)", chunk_index, len(parsed2))
+                        logger.debug("Chunk %s: parsed final JSON-only array (%d items)", chunk_index, len(parsed2))
                         return parsed2
                     s = final_text.find("[")
                     e = final_text.rfind("]")
                     if s != -1 and e != -1 and e > s:
                         parsed2 = json.loads(final_text[s:e + 1])
-                        logger.info("Chunk %s: parsed bracketed JSON-only array (%d items)", chunk_index, len(parsed2) if isinstance(parsed2, list) else 0)
+                        logger.debug("Chunk %s: parsed bracketed JSON-only array (%d items)", chunk_index, len(parsed2) if isinstance(parsed2, list) else 0)
                         return parsed2 if isinstance(parsed2, list) else []
                 except Exception:
                     logger.debug("Failed final JSON-only parse for chunk %s", chunk_index)
@@ -1208,7 +1174,7 @@ def compute_edge_for_markets(pairs_df: pd.DataFrame,
         # Run chunks in parallel
         outputs: list[dict] = []
         chunks = [events[i:i + chunk_size] for i in range(0, len(events), chunk_size)]
-        logger.info("Odds: submitting %d chunks (chunk_size=%d)", len(chunks), chunk_size)
+        logger.info("Submitting %d chunks (chunk_size=%d)", len(chunks), chunk_size)
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(process_chunk, idx, chunk) for idx, chunk in enumerate(chunks)]
             for future in concurrent.futures.as_completed(futures):
@@ -1216,55 +1182,85 @@ def compute_edge_for_markets(pairs_df: pd.DataFrame,
                     res = future.result()
                     if res:
                         outputs.extend(res)
-                    logger.info("Odds: chunk completed with %d items; total so far=%d", len(res) if res else 0, len(outputs))
+                    logger.debug("Chunk completed with %d items; total so far=%d", len(res) if res else 0, len(outputs))
                 except Exception:
-                    logger.exception("Odds parallel worker failed; continuing")
+                    logger.warning("Parallel worker failed; continuing")
         return outputs
     except Exception:
-        logger.exception("Unexpected error during compute_edge_for_markets")
+        logger.exception("Error during compute_edge_for_markets")
         return []
 
 
 if __name__ == "__main__":
     if not logger.handlers:
         logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    # Configure per-run file logging and prune old logs
     try:
         _configure_logging_for_run()
     except Exception:
         logger.debug("Failed to initialize per-run logging", exc_info=True)
 
-    parser = argparse.ArgumentParser(description="Filter markets and compute edges with optional debug shortcut")
-    parser.add_argument("--debug", action="store_true", help="Load saved cleaned pairs and skip filtering stage")
-    parser.add_argument("--cleaned-path", default=CLEANED_PAIRS_PATH_DEFAULT, help="Path to cleaned pairs CSV (used with --debug and for saving)")
+    parser = argparse.ArgumentParser(description="Filter markets and compute edges with stage control")
+    parser.add_argument(
+        "--debug",
+        choices=["remove", "compute"],
+        help=(
+            "Start from a specific stage: "
+            "'remove' runs remove_markets_to_avoid then compute_edge_for_markets; "
+            "'compute' loads cleaned pairs and runs compute_edge_for_markets."
+        ),
+    )
+    parser.add_argument("--cleaned-path", default=CLEANED_PAIRS_PATH_DEFAULT, help="Path to cleaned pairs CSV (load/save)")
     parser.add_argument("--odds-csv", default=os.path.join(ROOT_DIR, "data", "model_predictions.json"), help="Path to model predictions JSON (or CSV) for comparison")
     args = parser.parse_args()
 
-    clean_pairs = _load_cleaned_pairs(args.cleaned_path)
-    logger.info("[debug] Loaded cleaned pairs: %d rows", len(clean_pairs.index))
+    # Decide starting stage
+    start_stage = args.debug or "remove"
+    logger.info("Starting pipeline from stage: %s", start_stage)
 
-    if not args.debug:
-        # Build odds vs market comparison if odds CSV present
-        df = get_all_markets()
-        try:
-            logger.info("Fetched %d markets", len(df.index))
-        except Exception:
-            logger.info("Fetched markets frame with shape: %s", getattr(df, "shape", None))
-        pairs = get_market_name_token_pairs()
-        logger.info("Pair preview: %s", pairs.head())
-        clean_pairs = remove_markets_to_avoid(pairs)
+    # Stage: remove_markets_to_avoid
+    if start_stage == "remove":
+        # When explicitly debugging 'remove', load pairs from CSV instead of fetching markets
+        if args.debug == "remove":
+            pairs_df = _load_cleaned_pairs(args.cleaned_path)
+            try:
+                logger.info("[debug remove] Loaded pairs from %s (rows=%d)", args.cleaned_path, len(pairs_df.index))
+            except Exception:
+                logger.info("[debug remove] Loaded pairs from %s", args.cleaned_path)
+        else:
+            markets_df = get_all_markets()
+            if markets_df is not None and not markets_df.empty:
+                try:
+                    logger.info("Fetched %d markets", len(markets_df.index))
+                except Exception:
+                    logger.info("Fetched markets frame with shape: %s", getattr(markets_df, "shape", None))
+            pairs_df = get_market_name_token_pairs()
+            try:
+                logger.info("Pairs preview: %s", pairs_df.head())
+            except Exception:
+                pass
+        clean_pairs = remove_markets_to_avoid(pairs_df)
         try:
             _save_cleaned_pairs(clean_pairs, path=args.cleaned_path)
         except Exception:
             logger.debug("Unable to save cleaned pairs to custom path", exc_info=True)
-        logger.info("Cleaned pairs length: %s", len(clean_pairs))
-        logger.info("Cleaned pairs: %s", clean_pairs.head())
+        try:
+            logger.info("Cleaned pairs length: %s", len(clean_pairs))
+            logger.info("Cleaned pairs head: %s", clean_pairs.head())
+        except Exception:
+            pass
+    else:
+        # Stage: compute_edge_for_markets (load cleaned pairs)
+        clean_pairs = _load_cleaned_pairs(args.cleaned_path)
+        try:
+            logger.info("Loaded cleaned pairs from %s (rows=%d)", args.cleaned_path, len(clean_pairs.index))
+        except Exception:
+            logger.info("Loaded cleaned pairs from %s", args.cleaned_path)
 
+    # Stage: compute_edge_for_markets
     odds_results = compute_edge_for_markets(clean_pairs)
-    logger.info("Odds results length: %s", len(odds_results))
-    logger.info("Odds results: %s", odds_results)
+    logger.info("Computed odds items: %d", len(odds_results))
 
-    # Save model odds to data/model_predictions.json
+    # Persist computed odds
     try:
         odds_out_path = os.path.join(ROOT_DIR, "data", "model_predictions.json")
         os.makedirs(os.path.dirname(odds_out_path), exist_ok=True)
@@ -1273,10 +1269,11 @@ if __name__ == "__main__":
         logger.info("Wrote model odds to %s (items=%d)", odds_out_path, len(odds_results))
     except Exception:
         logger.exception("Failed to write model odds JSON")
-    try:
-        # Build odds DataFrame: start from computed odds_results (if any), override from CSV in --debug
-        odds_df_in = pd.DataFrame.from_records(odds_results if 'odds_results' in locals() else [])
-        if args.debug:
+
+    # Build comparison input: default to computed odds, optionally override from file in compute-stage debug
+    odds_df_in = pd.DataFrame.from_records(odds_results)
+    if start_stage == "compute":
+        try:
             if str(args.odds_csv).lower().endswith('.json'):
                 with open(args.odds_csv, 'r', encoding='utf-8') as fh:
                     data = json.load(fh)
@@ -1290,24 +1287,24 @@ if __name__ == "__main__":
             else:
                 odds_df_in = pd.read_csv(args.odds_csv)
 
-            # Save the loaded odds as the model odds snapshot for consistency
+            # Mirror previous behavior: also save the loaded odds snapshot
             try:
                 odds_records_dbg = odds_df_in.to_dict(orient='records')
                 odds_out_path = os.path.join(ROOT_DIR, 'data', 'model_predictions.json')
                 os.makedirs(os.path.dirname(odds_out_path), exist_ok=True)
                 with open(odds_out_path, 'w', encoding='utf-8') as fh:
                     json.dump({"results": odds_records_dbg}, fh, ensure_ascii=False, indent=2)
-                logger.info('Wrote model odds (debug) to %s (items=%d)', odds_out_path, len(odds_records_dbg))
+                logger.info('Wrote model odds (debug override) to %s (items=%d)', odds_out_path, len(odds_records_dbg))
             except Exception:
-                logger.exception('Failed to write model odds JSON (debug)')
+                logger.warning('Failed to write model odds JSON (debug override)')
+        except Exception:
+            logger.warning('Failed to load odds from file for debug compute stage')
 
-        comp_df = build_odds_market_comparison(odds_df_in)
-        if comp_df is not None and not comp_df.empty:
-            out_path = os.path.join(ROOT_DIR, 'data', 'odds_vs_market.csv')
-            os.makedirs(os.path.dirname(out_path), exist_ok=True)
-            comp_df.to_csv(out_path, index=False, encoding='utf-8-sig')
-            logger.info('Wrote odds vs market comparison to %s (rows=%d)', out_path, len(comp_df.index))
-        else:
-            logger.info('Odds vs market comparison produced no rows')
-    except Exception:
-        logger.exception('Failed to build odds vs market comparison')
+    comp_df = build_odds_market_comparison(odds_df_in)
+    if comp_df is not None and not comp_df.empty:
+        out_path = os.path.join(ROOT_DIR, 'data', 'odds_vs_market.csv')
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        comp_df.to_csv(out_path, index=False, encoding='utf-8-sig')
+        logger.info('Wrote odds vs market comparison to %s (rows=%d)', out_path, len(comp_df.index))
+    else:
+        logger.info('Odds vs market comparison produced no rows')

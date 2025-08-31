@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Odds vs Market</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+  <style>
+    .table { width: 100%; border-collapse: collapse; }
+    .table th, .table td { padding: 8px 10px; border-bottom: 1px solid #e5e7eb; }
+    .muted { color: #6b7280; font-size: 0.9em; }
+    .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+    .chip { display: inline-block; padding: 2px 6px; border-radius: 8px; background: #eef2ff; color: #3730a3; margin-right: 6px; }
+    .wrap { white-space: normal; word-break: break-word; }
+  </style>
+  <script>
+    async function fetchOdds() {
+      const res = await fetch('/api/odds');
+      const data = await res.json();
+      return data.data || [];
+    }
+
+    function formatSnapshots(snaps) {
+      if (!snaps || snaps.length === 0) return '<span class="muted">No snapshots</span>';
+      const head = '<tr><th>Time (UTC)</th><th>p_yes</th><th>p_no</th></tr>';
+      const rows = snaps.map(s => `
+        <tr>
+          <td class="muted mono">${s.ts_utc || ''}</td>
+          <td class="mono">${s.p_yes != null ? Number(s.p_yes).toFixed(3) : ''}</td>
+          <td class="mono">${s.p_no != null ? Number(s.p_no).toFixed(3) : ''}</td>
+        </tr>
+      `).join('');
+      return `<table class="table">${head}${rows}</table>`;
+    }
+
+    async function render() {
+      const container = document.getElementById('root');
+      container.innerHTML = '<div class="muted">Loading...</div>';
+      try {
+        const markets = (await fetchOdds()).slice().sort((a, b) => {
+          const ca = Number(a && a.confidence != null ? a.confidence : 0);
+          const cb = Number(b && b.confidence != null ? b.confidence : 0);
+          return cb - ca; // high -> low
+        });
+        if (!markets.length) {
+          container.innerHTML = '<div class="muted">No data available</div>';
+          return;
+        }
+        const rows = markets.map(m => `
+          <tr>
+            <td class="wrap">${m.market || ''}<div class="muted">${m.category || ''}</div></td>
+            <td class="mono">${m.p_model != null ? Number(m.p_model).toFixed(3) : ''}</td>
+            <td class="mono">${m.confidence != null ? Number(m.confidence).toFixed(2) : ''}</td>
+            <td class="wrap">${formatSnapshots(m.snapshots || [])}</td>
+          </tr>
+        `).join('');
+        container.innerHTML = `
+          <h1>Odds vs Market</h1>
+          <table class="table">
+            <thead>
+              <tr>
+                <th>Market</th>
+                <th>p_model</th>
+                <th>confidence</th>
+                <th>Hourly p_actuals</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${rows}
+            </tbody>
+          </table>
+        `;
+      } catch (e) {
+        container.innerHTML = '<div class="muted">Failed to load data</div>';
+      }
+    }
+
+    window.addEventListener('DOMContentLoaded', render);
+  </script>
+</head>
+<body>
+  <div id="root" style="max-width: 1100px; margin: 20px auto;"></div>
+</body>
+</html>
+
+
