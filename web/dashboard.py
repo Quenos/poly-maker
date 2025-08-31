@@ -4,7 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, RedirectResponse
-from fastapi import request
+from fastapi import Request
 from starlette.staticfiles import StaticFiles
 from dotenv import load_dotenv
 import requests
