@@ -27,3 +27,4 @@ tenacity>=8.4.1
 beautifulsoup4>=4.12.3
 html2text>=2024.2.26
 curl_cffi
+authlib

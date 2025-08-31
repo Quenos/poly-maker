@@ -1,10 +1,12 @@
+from starlette.middleware.sessions import SessionMiddleware
+from authlib.integrations.starlette_client import OAuth
 import logging
 import os
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, RedirectResponse
-from fastapi import Request
+from fastapi import Request, Depends
 from starlette.staticfiles import StaticFiles
 from dotenv import load_dotenv
 import requests
@@ -71,6 +73,68 @@ def _df_to_records(df: pd.DataFrame, fields: Optional[List[str]] = None) -> List
 
 
 app = FastAPI(title="Poly Maker Dashboard", version="0.1.0", root_path="/poly-maker")
+
+# add near top
+from starlette.middleware.sessions import SessionMiddleware
+from authlib.integrations.starlette_client import OAuth
+from fastapi import Request, Depends
+
+# after `app = FastAPI(..., root_path="/poly-maker")`
+app.add_middleware(
+    SessionMiddleware,
+    secret_key=os.getenv("SESSION_SECRET", "CHANGE_ME"),
+    session_cookie="poly_maker_sess",
+    https_only=True,
+    same_site="lax",
+    max_age=60*60*12,  # 12h
+)
+oauth = OAuth()
+oauth.register(
+    name="github",
+    client_id=os.getenv("GITHUB_CLIENT_ID"),
+    client_secret=os.getenv("GITHUB_CLIENT_SECRET"),
+    server_metadata_url="https://github.com/.well-known/openid-configuration",
+    client_kwargs={"scope": "read:user user:email"},
+)
+
+def require_user(req: Request):
+    user = req.session.get("user")
+    if not user:
+        # send them to login, preserving where they wanted to go
+        next_url = req.url.path
+        raise HTTPException(status_code=307, headers={"Location": f"{req.app.root_path}/login?next={next_url}"})
+    return user
+
+@app.get("/login", include_in_schema=False)
+async def login(request: Request):
+    redirect_uri = os.getenv("OAUTH_REDIRECT_URI") or str(request.url_for("auth_callback"))
+    return await oauth.github.authorize_redirect(request, redirect_uri)
+
+@app.get("/auth/callback", include_in_schema=False, name="auth_callback")
+async def auth_callback(request: Request):
+    token = await oauth.github.authorize_access_token(request)
+    userinfo = token.get("userinfo")
+    # Fallback if GitHub OIDC userinfo not present:
+    if not userinfo:
+        async with oauth.github.client as client:
+            resp = await client.get("https://api.github.com/user", headers={"Accept": "application/vnd.github+json"})
+            resp.raise_for_status()
+            userinfo = resp.json()
+    # Store only what you need
+    request.session["user"] = {
+        "id": userinfo.get("id"),
+        "login": userinfo.get("login"),
+        "name": userinfo.get("name") or userinfo.get("login"),
+        "avatar_url": userinfo.get("avatar_url"),
+    }
+    # Go back to dashboard or ?next=
+    next_url = request.query_params.get("next") or f"{request.app.root_path}/"
+    return RedirectResponse(next_url)
+
+@app.get("/logout", include_in_schema=False)
+def logout(request: Request):
+    request.session.clear()
+    return RedirectResponse(f"{request.app.root_path}/")
 
 
 # Static/UI
@@ -216,7 +280,7 @@ def index() -> FileResponse:
 
 
 @app.get("/pnl", include_in_schema=False)
-def pnl_page() -> FileResponse:
+def pnl_page(user=Depends(require_user)) -> FileResponse:
     index_path = os.path.join(STATIC_DIR, "pnl.html")
     if not os.path.exists(index_path):
         raise HTTPException(status_code=404, detail="pnl.html not found")
@@ -254,19 +318,19 @@ def _query_db(sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
 
 
 @app.get("/odds", include_in_schema=False)
-def odds_page(req: Request) -> RedirectResponse:
+def odds_page(req: Request, user=Depends(require_user)) -> RedirectResponse:
     return RedirectResponse(url=f"{req.app.root_path}/static/odds.html")
 
 @app.get("/odds/", include_in_schema=False)
-def odds_page_slash(req: Request) -> RedirectResponse:
+def odds_page_slash(req: Request, user=Depends(require_user)) -> RedirectResponse:
     return RedirectResponse(url=f"{req.app.root_path}/static/odds.html")
 
 @app.get("/odds.html", include_in_schema=False)
-def odds_page_html(req: Request) -> RedirectResponse:
+def odds_page_html(req: Request, user=Depends(require_user)) -> RedirectResponse:
     return RedirectResponse(url=f"{req.app.root_path}/static/odds.html")
 
 @app.get("/api/odds")
-def get_odds(limit: Optional[int] = None) -> Dict[str, Any]:
+def get_odds(limit: Optional[int] = None, user=Depends(require_user)) -> Dict[str, Any]:
     """Return markets with p_model and hourly p_actuals for both tokens (and yes/no when available)."""
     markets = _query_db(
         "SELECT question, title, category, token1, token2, p_model, confidence FROM markets"
@@ -309,7 +373,7 @@ def get_odds(limit: Optional[int] = None) -> Dict[str, Any]:
 
 
 @app.get("/api/orders")
-def get_open_orders() -> Dict[str, Any]:
+def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
     client = _ensure_client()
     try:
         orders_df = client.get_all_orders()
@@ -356,7 +420,7 @@ def get_open_orders() -> Dict[str, Any]:
 
 
 @app.get("/api/positions")
-def get_positions() -> Dict[str, Any]:
+def get_positions(user=Depends(require_user)) -> Dict[str, Any]:
     client = _ensure_client()
     try:
         pos_df = client.get_all_positions()
@@ -388,7 +452,7 @@ def get_positions() -> Dict[str, Any]:
 
 
 @app.get("/api/trades")
-def get_recent_trades(limit: int = 10, page: int = 1) -> Dict[str, Any]:
+def get_recent_trades(limit: int = 10, page: int = 1, user=Depends(require_user)) -> Dict[str, Any]:
     wallet = (os.getenv("BROWSER_WALLET") or os.getenv("BROWSER_ADDRESS") or "").strip()
     if not wallet:
         raise HTTPException(status_code=400, detail="BROWSER_WALLET/BROWSER_ADDRESS not configured")
@@ -604,7 +668,7 @@ def _compute_current_pnl(wallet: str) -> Dict[str, Any]:
 
 
 @app.get("/api/pnl")
-def get_pnl() -> Dict[str, Any]:
+def get_pnl(user=Depends(require_user)) -> Dict[str, Any]:
     wallet = (os.getenv("BROWSER_WALLET") or os.getenv("BROWSER_ADDRESS") or "").strip()
     if not wallet:
         raise HTTPException(status_code=400, detail="BROWSER_WALLET/BROWSER_ADDRESS not configured")
@@ -617,7 +681,7 @@ def get_pnl() -> Dict[str, Any]:
 
 
 @app.get("/api/pnl/trades")
-def get_pnl_trades(limit: int = 100, page: int = 1) -> Dict[str, Any]:
+def get_pnl_trades(limit: int = 100, page: int = 1, user=Depends(require_user)) -> Dict[str, Any]:
     """Return per-trade cash flows derived from activity for PnL accounting."""
     wallet = (os.getenv("BROWSER_WALLET") or os.getenv("BROWSER_ADDRESS") or "").strip()
     if not wallet:
