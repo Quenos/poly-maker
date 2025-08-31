@@ -74,11 +74,6 @@ def _df_to_records(df: pd.DataFrame, fields: Optional[List[str]] = None) -> List
 
 app = FastAPI(title="Poly Maker Dashboard", version="0.1.0", root_path="/poly-maker")
 
-# add near top
-from starlette.middleware.sessions import SessionMiddleware
-from authlib.integrations.starlette_client import OAuth
-from fastapi import Request, Depends
-
 # after `app = FastAPI(..., root_path="/poly-maker")`
 app.add_middleware(
     SessionMiddleware,
@@ -93,8 +88,10 @@ oauth.register(
     name="github",
     client_id=os.getenv("GITHUB_CLIENT_ID"),
     client_secret=os.getenv("GITHUB_CLIENT_SECRET"),
-    server_metadata_url="https://github.com/.well-known/openid-configuration",
-    client_kwargs={"scope": "read:user user:email"},
+    authorize_url="https://github.com/login/oauth/authorize",
+    access_token_url="https://github.com/login/oauth/access_token",
+    api_base_url="https://api.github.com/",
+    client_kwargs={"scope": "read:user user:email", "token_placement": "header"},
 )
 
 def require_user(req: Request):
