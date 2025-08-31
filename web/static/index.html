@@ -4,13 +4,14 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Poly Maker Dashboard</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <base href="/poly-maker/">
+    <link rel="stylesheet" href="static/styles.css" />
   </head>
   <body>
     <div class="container">
       <div class="header-row">
         <h1>Poly Maker Dashboard</h1>
-        <a id="total-pnl" class="pill" href="/pnl" title="View per-trade PnL">PnL: —</a>
+        <a id="total-pnl" class="pill" href="pnl" title="View per-trade PnL">PnL: —</a>
       </div>
 
       <section>
@@ -141,10 +142,10 @@
       async function refresh() {
         try {
           const [orders, positions, trades, pnl] = await Promise.all([
-            fetchJson('/api/orders'),
-            fetchJson('/api/positions'),
-            fetchJson(`/api/trades?limit=${tradesPerPage}&page=${tradePage}`),
-            fetchJson('/api/pnl'),
+            fetchJson('api/orders'),
+            fetchJson('api/positions'),
+            fetchJson(`api/trades?limit=${tradesPerPage}&page=${tradePage}`),
+            fetchJson('api/pnl'),
           ]);
 
           setRows(document.querySelector('#orders tbody'), orders.data || [], [

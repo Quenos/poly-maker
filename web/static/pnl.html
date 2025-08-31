@@ -4,13 +4,14 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Per-Trade PnL</title>
-    <link rel="stylesheet" href="/static/styles.css" />
+    <base href="/poly-maker/">
+    <link rel="stylesheet" href="static/styles.css" />
   </head>
   <body>
     <div class="container">
       <div class="header-row">
         <h1>PnL Overview</h1>
-        <a class="pill" href="/">Back to Dashboard</a>
+        <a class="pill" href="/poly-maker/">Back to Dashboard</a>
       </div>
 
       <section>
@@ -105,7 +106,7 @@
 
       async function refresh() {
         try {
-          const data = await fetchJson('/api/pnl');
+          const data = await fetchJson('api/pnl');
           setPills(data || {});
           setRows(document.querySelector('#pnl-summary tbody'), (data && data.rows) || []);
         } catch (e) {

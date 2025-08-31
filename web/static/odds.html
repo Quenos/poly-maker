@@ -4,7 +4,8 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Odds vs Market</title>
-  <link rel="stylesheet" href="/static/styles.css" />
+  <base href="/poly-maker/">
+  <link rel="stylesheet" href="static/styles.css" />
   <style>
     .table { width: 100%; border-collapse: collapse; }
     .table th, .table td { padding: 8px 10px; border-bottom: 1px solid #e5e7eb; }
@@ -15,7 +16,7 @@
   </style>
   <script>
     async function fetchOdds() {
-      const res = await fetch('/api/odds');
+      const res = await fetch('api/odds');
       const data = await res.json();
       return data.data || [];
     }

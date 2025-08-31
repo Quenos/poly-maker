@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, RedirectResponse
+from fastapi import request
 from starlette.staticfiles import StaticFiles
 from dotenv import load_dotenv
 import requests
@@ -69,7 +70,7 @@ def _df_to_records(df: pd.DataFrame, fields: Optional[List[str]] = None) -> List
     return pd.DataFrame(df).where(pd.notna(df), None).to_dict(orient="records")
 
 
-app = FastAPI(title="Poly Maker Dashboard", version="0.1.0")
+app = FastAPI(title="Poly Maker Dashboard", version="0.1.0", root_path="/poly-maker")
 
 
 # Static/UI
@@ -253,19 +254,16 @@ def _query_db(sql: str, params: Tuple[Any, ...] = ()) -> List[Dict[str, Any]]:
 
 
 @app.get("/odds", include_in_schema=False)
-def odds_page() -> RedirectResponse:
-    return RedirectResponse(url="/static/odds.html")
-
+def odds_page(req: Request) -> RedirectResponse:
+    return RedirectResponse(url=f"{req.app.root_path}/static/odds.html")
 
 @app.get("/odds/", include_in_schema=False)
-def odds_page_slash() -> RedirectResponse:
-    return RedirectResponse(url="/static/odds.html")
-
+def odds_page_slash(req: Request) -> RedirectResponse:
+    return RedirectResponse(url=f"{req.app.root_path}/static/odds.html")
 
 @app.get("/odds.html", include_in_schema=False)
-def odds_page_html() -> RedirectResponse:
-    return RedirectResponse(url="/static/odds.html")
-
+def odds_page_html(req: Request) -> RedirectResponse:
+    return RedirectResponse(url=f"{req.app.root_path}/static/odds.html")
 
 @app.get("/api/odds")
 def get_odds(limit: Optional[int] = None) -> Dict[str, Any]:
