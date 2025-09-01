@@ -529,6 +529,11 @@ def get_positions(user=Depends(require_user)) -> Dict[str, Any]:
         pos_df = client.get_all_positions()
         # Enrich with market name and outcome (API-first)
         if pos_df is not None and not pos_df.empty:
+            # Ensure target columns exist for safe masking/assignment
+            if "market_name" not in pos_df.columns:
+                pos_df["market_name"] = ""
+            if "outcome" not in pos_df.columns:
+                pos_df["outcome"] = ""
             # 1) Assets API by token IDs
             if "asset" in pos_df.columns:
                 try:
@@ -560,14 +565,14 @@ def get_positions(user=Depends(require_user)) -> Dict[str, Any]:
             # 3) Fallback to sheet-based mappings
             t2m, t2o, m2n = _build_metadata_maps()
             if "asset" in pos_df.columns:
-                mask = pos_df.get("market_name", "").eq("") & pos_df["asset"].notna()
+                mask = pos_df["market_name"].eq("") & pos_df["asset"].notna()
                 if mask.any():
                     pos_df.loc[mask, "market_name"] = pos_df.loc[mask, "asset"].astype(str).map(t2m).fillna(pos_df.loc[mask, "market_name"]) 
-                mask_out = pos_df.get("outcome", "").eq("") & pos_df["asset"].notna()
+                mask_out = pos_df["outcome"].eq("") & pos_df["asset"].notna()
                 if mask_out.any():
                     pos_df.loc[mask_out, "outcome"] = pos_df.loc[mask_out, "asset"].astype(str).map(t2o).fillna(pos_df.loc[mask_out, "outcome"]) 
             if "market" in pos_df.columns:
-                mask = pos_df.get("market_name", "").eq("") & pos_df["market"].notna()
+                mask = pos_df["market_name"].eq("") & pos_df["market"].notna()
                 if mask.any():
                     pos_df.loc[mask, "market_name"] = pos_df.loc[mask, "market"].astype(str).map(m2n).fillna(pos_df.loc[mask, "market_name"]) 
         wanted = ["market_name", "outcome", "size", "avgPrice", "curPrice", "percentPnl"]
