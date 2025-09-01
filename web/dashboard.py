@@ -465,6 +465,11 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
         # Filter to open/live if status exists
         if "status" in orders_df.columns:
             orders_df = orders_df[orders_df["status"].isin(["LIVE", "OPEN"])].copy()
+        # Ensure target columns exist for safe masking/assignment
+        if "market_name" not in orders_df.columns:
+            orders_df["market_name"] = ""
+        if "outcome" not in orders_df.columns:
+            orders_df["outcome"] = ""
         # API-first enrichment: try assets API by token IDs
         if "asset_id" in orders_df.columns:
             try:
@@ -474,11 +479,11 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
             if token_ids:
                 tm_f, to_f, _ = _fetch_assets_metadata(token_ids)
                 if tm_f:
-                    orders_df["market_name"] = orders_df.get("market_name", "")
-                    orders_df["market_name"] = orders_df.get("asset_id").astype(str).map(tm_f).fillna(orders_df.get("market_name", ""))
+                    orders_df["market_name"] = orders_df["market_name"].astype(str)
+                    orders_df["market_name"] = orders_df["asset_id"].astype(str).map(tm_f).fillna(orders_df["market_name"])
                 if to_f:
-                    orders_df["outcome"] = orders_df.get("outcome", "")
-                    orders_df["outcome"] = orders_df.get("asset_id").astype(str).map(to_f).fillna(orders_df.get("outcome", ""))
+                    orders_df["outcome"] = orders_df["outcome"].astype(str)
+                    orders_df["outcome"] = orders_df["asset_id"].astype(str).map(to_f).fillna(orders_df["outcome"])
         # Next, try markets API by market IDs for any still-missing names
         if "market_name" in orders_df.columns and orders_df["market_name"].eq("").any() and "market" in orders_df.columns:
             missing_mids = sorted(set(orders_df.loc[orders_df["market_name"].eq("") & orders_df["market"].notna(), "market"].astype(str)))
@@ -494,14 +499,14 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
         # Finally, fallback to sheet-based mapping if anything is still blank
         t2m, t2o, m2n = _build_metadata_maps()
         if "asset_id" in orders_df.columns:
-            mask = orders_df.get("market_name", "").eq("") & orders_df["asset_id"].notna()
+            mask = orders_df["market_name"].eq("") & orders_df["asset_id"].notna()
             if mask.any():
                 orders_df.loc[mask, "market_name"] = orders_df.loc[mask, "asset_id"].astype(str).map(t2m).fillna(orders_df.loc[mask, "market_name"])
-            mask_out = orders_df.get("outcome", "").eq("") & orders_df["asset_id"].notna()
+            mask_out = orders_df["outcome"].eq("") & orders_df["asset_id"].notna()
             if mask_out.any():
                 orders_df.loc[mask_out, "outcome"] = orders_df.loc[mask_out, "asset_id"].astype(str).map(t2o).fillna(orders_df.loc[mask_out, "outcome"])
         if "market" in orders_df.columns:
-            mask = orders_df.get("market_name", "").eq("") & orders_df["market"].notna()
+            mask = orders_df["market_name"].eq("") & orders_df["market"].notna()
             if mask.any():
                 orders_df.loc[mask, "market_name"] = orders_df.loc[mask, "market"].astype(str).map(m2n).fillna(orders_df.loc[mask, "market_name"]) 
         # Normalize fields commonly used
