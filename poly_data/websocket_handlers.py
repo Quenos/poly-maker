@@ -35,6 +35,9 @@ async def connect_market_websocket(chunk):
         try:
             # Process incoming market data indefinitely
             last_msg_time = time.time()
+            # Track the set of tokens we subscribed to; if it changes in global_state, trigger resubscribe
+            subscribed_tokens = set(str(t) for t in (chunk or []))
+            last_check = time.time()
             while True:
                 try:
                     message = await asyncio.wait_for(websocket.recv(), timeout=30)
@@ -45,6 +48,14 @@ async def connect_market_websocket(chunk):
                 except asyncio.TimeoutError:
                     # Heartbeat every 30s without messages
                     print(f"Market WS heartbeat: subscribed assets {len(chunk)}, last msg {int(time.time()-last_msg_time)}s ago")
+                # Periodically check if selected markets (tokens) changed in another thread
+                if time.time() - last_check >= 5:
+                    current_tokens = set(str(t) for t in (global_state.all_tokens or []))
+                    if current_tokens != subscribed_tokens:
+                        print("Detected change in selected markets; re-subscribing market websocket")
+                        # Exiting will let the main loop reconnect with the updated token list
+                        return
+                    last_check = time.time()
         except websockets.ConnectionClosed:
             print("Connection closed in market websocket")
             print(traceback.format_exc())

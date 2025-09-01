@@ -279,6 +279,81 @@ def _fetch_markets_metadata(
     return market_to_name, token_to_outcome
 
 
+def _fetch_assets_metadata(
+    token_ids: List[str],
+) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
+    """
+    Fetch metadata for given asset (token) IDs.
+
+    Returns:
+        token_to_market_name, token_to_outcome, token_to_market_id
+    """
+    headers = {
+        "User-Agent": "poly-maker-dashboard/1.0",
+        "Accept": "application/json",
+    }
+    token_to_market_name: Dict[str, str] = {}
+    token_to_outcome: Dict[str, str] = {}
+    token_to_market_id: Dict[str, str] = {}
+
+    def harvest(items: List[Dict[str, Any]]) -> None:
+        for a in items:
+            try:
+                tid = a.get("id") or a.get("token_id") or a.get("asset_id") or a.get("tokenId")
+                if tid is None:
+                    continue
+                tid_s = str(tid)
+                mid = a.get("market") or a.get("conditionId") or a.get("market_id")
+                name = (a.get("market_title") or a.get("question") or a.get("title") or a.get("name"))
+                out = a.get("outcome") or a.get("answer") or a.get("title")
+                if mid:
+                    token_to_market_id[tid_s] = str(mid)
+                if name:
+                    token_to_market_name[tid_s] = str(name)
+                if out:
+                    token_to_outcome[tid_s] = str(out)
+            except Exception:
+                continue
+
+    if not token_ids:
+        return token_to_market_name, token_to_outcome, token_to_market_id
+
+    ids_param = ",".join(sorted(set([str(x) for x in token_ids if x])))
+    for base in [
+        "https://clob.polymarket.com/assets?ids=",
+        "https://data-api.polymarket.com/assets?ids=",
+    ]:
+        try:
+            resp = requests.get(base + ids_param, headers=headers, timeout=10)
+            if not resp.ok:
+                continue
+            data = resp.json()
+            items: List[Dict[str, Any]]
+            if isinstance(data, dict) and "assets" in data:
+                items = data.get("assets", [])
+            elif isinstance(data, list):
+                items = data
+            else:
+                items = [data]
+            harvest(items)
+            if token_to_market_name:
+                break
+        except Exception:
+            continue
+
+    # If we learned market IDs but not names, try to fetch names
+    unresolved_mids = sorted(set([
+        mid for tid, mid in token_to_market_id.items() if tid in token_to_market_name and not token_to_market_name.get(tid)
+    ]))
+    if unresolved_mids:
+        m2n, _ = _fetch_markets_metadata(unresolved_mids)
+        for tid, mid in token_to_market_id.items():
+            if tid not in token_to_market_name and mid in m2n:
+                token_to_market_name[tid] = m2n[mid]
+
+    return token_to_market_name, token_to_outcome, token_to_market_id
+
+
 @app.get("/", include_in_schema=False)
 def index() -> FileResponse:
     index_path = os.path.join(STATIC_DIR, "index.html")
@@ -409,6 +484,17 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
                 if t2o_f and "asset_id" in orders_df.columns:
                     mask = orders_df["outcome"].eq("") & orders_df["asset_id"].notna()
                     orders_df.loc[mask, "outcome"] = orders_df.loc[mask, "asset_id"].astype(str).map(t2o_f).fillna("")
+        # As a last resort, fetch metadata directly by asset IDs for any rows still missing names
+        if "market_name" in orders_df.columns and orders_df["market_name"].eq("").any() and "asset_id" in orders_df.columns:
+            missing_tokens = sorted(set(orders_df.loc[orders_df["market_name"].eq("") & orders_df["asset_id"].notna(), "asset_id"].astype(str)))
+            if missing_tokens:
+                tm_f, to_f, _ = _fetch_assets_metadata(missing_tokens)
+                if tm_f:
+                    mask = orders_df["market_name"].eq("") & orders_df["asset_id"].notna()
+                    orders_df.loc[mask, "market_name"] = orders_df.loc[mask, "asset_id"].astype(str).map(tm_f).fillna(orders_df.loc[mask, "market_name"])
+                if to_f:
+                    mask = orders_df["outcome"].eq("") & orders_df["asset_id"].notna()
+                    orders_df.loc[mask, "outcome"] = orders_df.loc[mask, "asset_id"].astype(str).map(to_f).fillna(orders_df.loc[mask, "outcome"])
         # Normalize fields commonly used
         wanted = [
             "id",

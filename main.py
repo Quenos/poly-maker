@@ -39,10 +39,10 @@ def remove_from_pending():
                         print(f"Removing stale entry {trade_id} from {col} after 15 seconds")
                         remove_from_performing(col, trade_id)
                         print("After removing: ", global_state.performing, global_state.performing_timestamps)
-                except:
+                except:  # noqa: E722
                     print("Error in remove_from_pending")
                     print(traceback.format_exc())                
-    except:
+    except:  # noqa: E722
         print("Error in remove_from_pending")
         print(traceback.format_exc())
 
@@ -72,7 +72,7 @@ def update_periodically():
                     
             gc.collect()  # Force garbage collection to free memory
             i += 1
-        except:
+        except:  # noqa: E722
             print("Error in update_periodically")
             print(traceback.format_exc())
             
@@ -98,13 +98,22 @@ async def main():
     # Main loop - maintain websocket connections
     while True:
         try:
-            # Connect to market and user websockets simultaneously
-            await asyncio.gather(
-                connect_market_websocket(global_state.all_tokens), 
-                connect_user_websocket()
-            )
+            # Connect to market and user websockets as tasks and reconnect when either finishes
+            market_task = asyncio.create_task(connect_market_websocket(global_state.all_tokens))
+            user_task = asyncio.create_task(connect_user_websocket())
+
+            done, pending = await asyncio.wait({market_task, user_task}, return_when=asyncio.FIRST_COMPLETED)
+
+            # Cancel any remaining tasks to force a clean reconnect
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except Exception:
+                    pass
+
             print("Reconnecting to the websocket")
-        except:
+        except:  # noqa: E722
             print("Error in main loop")
             print(traceback.format_exc())
             
