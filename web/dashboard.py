@@ -465,14 +465,21 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
         # Filter to open/live if status exists
         if "status" in orders_df.columns:
             orders_df = orders_df[orders_df["status"].isin(["LIVE", "OPEN"])].copy()
-        # Enrich with market name and outcome using mapping
-        t2m, t2o, m2n = _build_metadata_maps()
+        # API-first enrichment: try assets API by token IDs
         if "asset_id" in orders_df.columns:
-            orders_df["market_name"] = orders_df["asset_id"].astype(str).map(t2m).fillna("")
-            orders_df["outcome"] = orders_df["asset_id"].astype(str).map(t2o).fillna("")
-        if "market" in orders_df.columns and ("market_name" not in orders_df.columns or orders_df["market_name"].eq("").all()):
-            orders_df["market_name"] = orders_df["market"].astype(str).map(m2n).fillna(orders_df.get("market_name", ""))
-        # If still missing names, try remote fetch by market ids
+            try:
+                token_ids = sorted(set(orders_df["asset_id"].dropna().astype(str)))
+            except Exception:
+                token_ids = []
+            if token_ids:
+                tm_f, to_f, _ = _fetch_assets_metadata(token_ids)
+                if tm_f:
+                    orders_df["market_name"] = orders_df.get("market_name", "")
+                    orders_df["market_name"] = orders_df.get("asset_id").astype(str).map(tm_f).fillna(orders_df.get("market_name", ""))
+                if to_f:
+                    orders_df["outcome"] = orders_df.get("outcome", "")
+                    orders_df["outcome"] = orders_df.get("asset_id").astype(str).map(to_f).fillna(orders_df.get("outcome", ""))
+        # Next, try markets API by market IDs for any still-missing names
         if "market_name" in orders_df.columns and orders_df["market_name"].eq("").any() and "market" in orders_df.columns:
             missing_mids = sorted(set(orders_df.loc[orders_df["market_name"].eq("") & orders_df["market"].notna(), "market"].astype(str)))
             if missing_mids:
@@ -484,17 +491,19 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
                 if t2o_f and "asset_id" in orders_df.columns:
                     mask = orders_df["outcome"].eq("") & orders_df["asset_id"].notna()
                     orders_df.loc[mask, "outcome"] = orders_df.loc[mask, "asset_id"].astype(str).map(t2o_f).fillna("")
-        # As a last resort, fetch metadata directly by asset IDs for any rows still missing names
-        if "market_name" in orders_df.columns and orders_df["market_name"].eq("").any() and "asset_id" in orders_df.columns:
-            missing_tokens = sorted(set(orders_df.loc[orders_df["market_name"].eq("") & orders_df["asset_id"].notna(), "asset_id"].astype(str)))
-            if missing_tokens:
-                tm_f, to_f, _ = _fetch_assets_metadata(missing_tokens)
-                if tm_f:
-                    mask = orders_df["market_name"].eq("") & orders_df["asset_id"].notna()
-                    orders_df.loc[mask, "market_name"] = orders_df.loc[mask, "asset_id"].astype(str).map(tm_f).fillna(orders_df.loc[mask, "market_name"])
-                if to_f:
-                    mask = orders_df["outcome"].eq("") & orders_df["asset_id"].notna()
-                    orders_df.loc[mask, "outcome"] = orders_df.loc[mask, "asset_id"].astype(str).map(to_f).fillna(orders_df.loc[mask, "outcome"])
+        # Finally, fallback to sheet-based mapping if anything is still blank
+        t2m, t2o, m2n = _build_metadata_maps()
+        if "asset_id" in orders_df.columns:
+            mask = orders_df.get("market_name", "").eq("") & orders_df["asset_id"].notna()
+            if mask.any():
+                orders_df.loc[mask, "market_name"] = orders_df.loc[mask, "asset_id"].astype(str).map(t2m).fillna(orders_df.loc[mask, "market_name"])
+            mask_out = orders_df.get("outcome", "").eq("") & orders_df["asset_id"].notna()
+            if mask_out.any():
+                orders_df.loc[mask_out, "outcome"] = orders_df.loc[mask_out, "asset_id"].astype(str).map(t2o).fillna(orders_df.loc[mask_out, "outcome"])
+        if "market" in orders_df.columns:
+            mask = orders_df.get("market_name", "").eq("") & orders_df["market"].notna()
+            if mask.any():
+                orders_df.loc[mask, "market_name"] = orders_df.loc[mask, "market"].astype(str).map(m2n).fillna(orders_df.loc[mask, "market_name"]) 
         # Normalize fields commonly used
         wanted = [
             "id",
@@ -518,15 +527,24 @@ def get_positions(user=Depends(require_user)) -> Dict[str, Any]:
     client = _ensure_client()
     try:
         pos_df = client.get_all_positions()
-        # Enrich with market name and outcome
-        t2m, t2o, m2n = _build_metadata_maps()
+        # Enrich with market name and outcome (API-first)
         if pos_df is not None and not pos_df.empty:
+            # 1) Assets API by token IDs
             if "asset" in pos_df.columns:
-                pos_df["market_name"] = pos_df["asset"].astype(str).map(t2m).fillna("")
-                pos_df["outcome"] = pos_df["asset"].astype(str).map(t2o).fillna("")
-            if "market" in pos_df.columns and ("market_name" not in pos_df.columns or pos_df["market_name"].eq("").all()):
-                pos_df["market_name"] = pos_df["market"].astype(str).map(m2n).fillna(pos_df.get("market_name", ""))
-            # Fetch missing names remotely if needed
+                try:
+                    token_ids = sorted(set(pos_df["asset"].dropna().astype(str)))
+                except Exception:
+                    token_ids = []
+                if token_ids:
+                    tm_f, to_f, _ = _fetch_assets_metadata(token_ids)
+                    if tm_f:
+                        pos_df["market_name"] = pos_df.get("market_name", "")
+                        pos_df["market_name"] = pos_df.get("asset").astype(str).map(tm_f).fillna(pos_df.get("market_name", ""))
+                    if to_f:
+                        pos_df["outcome"] = pos_df.get("outcome", "")
+                        pos_df["outcome"] = pos_df.get("asset").astype(str).map(to_f).fillna(pos_df.get("outcome", ""))
+
+            # 2) Markets API by market IDs for any still-missing names
             if "market_name" in pos_df.columns and pos_df["market_name"].eq("").any() and "market" in pos_df.columns:
                 missing_mids = sorted(set(pos_df.loc[pos_df["market_name"].eq("") & pos_df["market"].notna(), "market"].astype(str)))
                 if missing_mids:
@@ -538,6 +556,20 @@ def get_positions(user=Depends(require_user)) -> Dict[str, Any]:
                     if t2o_f and "asset" in pos_df.columns:
                         mask = pos_df["outcome"].eq("") & pos_df["asset"].notna()
                         pos_df.loc[mask, "outcome"] = pos_df.loc[mask, "asset"].astype(str).map(t2o_f).fillna("")
+
+            # 3) Fallback to sheet-based mappings
+            t2m, t2o, m2n = _build_metadata_maps()
+            if "asset" in pos_df.columns:
+                mask = pos_df.get("market_name", "").eq("") & pos_df["asset"].notna()
+                if mask.any():
+                    pos_df.loc[mask, "market_name"] = pos_df.loc[mask, "asset"].astype(str).map(t2m).fillna(pos_df.loc[mask, "market_name"]) 
+                mask_out = pos_df.get("outcome", "").eq("") & pos_df["asset"].notna()
+                if mask_out.any():
+                    pos_df.loc[mask_out, "outcome"] = pos_df.loc[mask_out, "asset"].astype(str).map(t2o).fillna(pos_df.loc[mask_out, "outcome"]) 
+            if "market" in pos_df.columns:
+                mask = pos_df.get("market_name", "").eq("") & pos_df["market"].notna()
+                if mask.any():
+                    pos_df.loc[mask, "market_name"] = pos_df.loc[mask, "market"].astype(str).map(m2n).fillna(pos_df.loc[mask, "market_name"]) 
         wanted = ["market_name", "outcome", "size", "avgPrice", "curPrice", "percentPnl"]
         return {"data": _df_to_records(pos_df, wanted)}
     except Exception as exc:
