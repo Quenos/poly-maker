@@ -89,15 +89,26 @@ async function mergePositions(amountToMerge, conditionId, isNegRiskMarket) {
 
     // Direct EOA send (no Safe)
     const feeData = await provider.getFeeData();
+    // Enforce a minimum priority tip to satisfy Polygon RPC limits
+    const minTip = ethers.utils.parseUnits('25', 'gwei');
+    const suggestedTip = feeData.maxPriorityFeePerGas || ethers.BigNumber.from(0);
+    const priorityFee = suggestedTip.gte(minTip) ? suggestedTip : minTip;
+
+    // Choose a max fee: at least 2x the tip, or the provider suggestion if higher
+    const suggestedMax = feeData.maxFeePerGas || ethers.BigNumber.from(0);
+    const minMaxFee = priorityFee.mul(2);
+    const maxFee = suggestedMax.gte(minMaxFee) ? suggestedMax : minMaxFee;
+
     let txResponse;
     try {
       txResponse = await wallet.sendTransaction({
         to: tx.to,
         data: tx.data,
         gasLimit: gasLimit,
-        maxFeePerGas: feeData.maxFeePerGas ?? gasPrice,
-        maxPriorityFeePerGas: feeData.maxPriorityFeePerGas ?? gasPrice,
-        nonce: nonce
+        maxPriorityFeePerGas: priorityFee,
+        maxFeePerGas: maxFee,
+        nonce: nonce,
+        type: 2
       });
     } catch (err) {
       console.error("Send failed:", err?.reason || err?.message || err);
