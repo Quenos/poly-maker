@@ -28,3 +28,4 @@ beautifulsoup4>=4.12.3
 html2text>=2024.2.26
 curl_cffi
 authlib
+prometheus_client>=0.20.0
