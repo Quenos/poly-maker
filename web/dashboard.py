@@ -357,6 +357,58 @@ def _fetch_assets_metadata(
     return token_to_market_name, token_to_outcome, token_to_market_id
 
 
+def _fetch_market_and_token_names_bulk(limit: int = 1000) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Fetch broad market listings and build maps:
+    - token_id -> market_name
+    - market_id (conditionId) -> market_name
+
+    Uses CLOB and data-api as in list_open_orders.py for robust coverage.
+    """
+    headers = {"User-Agent": "poly-maker-dashboard/1.0", "Accept": "application/json"}
+    token_to_market_name: Dict[str, str] = {}
+    market_to_name: Dict[str, str] = {}
+
+    def harvest(markets_json: List[Dict[str, Any]]) -> None:
+        for m in markets_json:
+            try:
+                name = (m.get("question") or m.get("title") or m.get("name") or m.get("slug") or m.get("questionTitle") or "")
+                mid = m.get("id") or m.get("market") or m.get("conditionId")
+                if mid:
+                    market_to_name[str(mid)] = str(name)
+                for key in ("outcomes", "tokens", "outcomeTokens"):
+                    if key in m and isinstance(m[key], list):
+                        for o in m[key]:
+                            if isinstance(o, dict):
+                                tid = o.get("token_id") or o.get("tokenId") or o.get("id")
+                                if tid:
+                                    token_to_market_name[str(tid)] = str(name)
+            except Exception:
+                continue
+
+    urls = [
+        f"https://clob.polymarket.com/markets?limit={limit}",
+        f"https://data-api.polymarket.com/markets?limit={limit}"
+    ]
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            if not resp.ok:
+                continue
+            data = resp.json()
+            items: List[Dict[str, Any]]
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict) and "markets" in data:
+                items = data.get("markets", [])
+            else:
+                items = [data]
+            if isinstance(items, list):
+                harvest(items)
+        except Exception:
+            continue
+
+    return token_to_market_name, market_to_name
+
 def _fetch_conditions_questions_gamma(condition_ids: List[str]) -> Dict[str, str]:
     """Fetch condition questions by condition ids using Gamma API.
 
@@ -524,27 +576,22 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
         # Log the columns we have to debug
         logger.info(f"Order columns: {list(orders_df.columns)}")
         
-        # 0) Primary: resolve market names via Gamma markets/{id} using 'market' (condition_id)
-        if "market" in orders_df.columns and orders_df["market"].notna().any():
-            unique_mids = sorted(set(orders_df["market"].dropna().astype(str)))
-            logger.info(f"Resolving market names via Gamma markets/{{id}} for {len(unique_mids)} markets")
-            m2n_primary: Dict[str, str] = {}
-            headers = {"User-Agent": "poly-maker-dashboard/1.0", "Accept": "application/json"}
-            gamma_base_url = "https://gamma-api.polymarket.com"
-            for mid in unique_mids:
-                try:
-                    resp = requests.get(f"{gamma_base_url}/markets/{mid}", headers=headers, timeout=10)
-                    if not resp.ok:
-                        continue
-                    data = resp.json()
-                    name = data.get("question") or data.get("title") or data.get("name")
-                    if name:
-                        m2n_primary[str(mid)] = str(name)
-                except Exception:
-                    continue
-            if m2n_primary:
-                orders_df["market_name"] = orders_df["market"].astype(str).map(m2n_primary).fillna(orders_df["market_name"])
-                logger.info(f"Mapped {len(m2n_primary)} market names from Gamma markets/{{id}} (primary)")
+        # 0) Primary: resolve market names via bulk markets list (CLOB/data-api) like list_open_orders
+        logger.info("Resolving market names via bulk markets list (CLOB/data-api)")
+        t2n_bulk, m2n_bulk = _fetch_market_and_token_names_bulk(limit=1000)
+        if t2n_bulk or m2n_bulk:
+            # Prefer token->name when asset column exists
+            asset_col = None
+            for col in ["asset", "token_id", "tokenId", "asset_id"]:
+                if col in orders_df.columns:
+                    asset_col = col
+                    break
+            if asset_col and t2n_bulk:
+                orders_df["market_name"] = orders_df[asset_col].astype(str).map(t2n_bulk).fillna(orders_df["market_name"])
+                logger.info(f"Filled market names from token map for column '{asset_col}'")
+            if "market" in orders_df.columns and m2n_bulk:
+                orders_df["market_name"] = orders_df["market"].astype(str).map(m2n_bulk).fillna(orders_df["market_name"])
+                logger.info("Filled market names from market id map")
         
         # 1) Use existing title column to fill any still-empty names
         if "title" in orders_df.columns and orders_df["title"].notna().any():
