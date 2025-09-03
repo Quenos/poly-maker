@@ -560,46 +560,91 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
     client = _ensure_client()
     try:
         orders_df = client.get_all_orders()
+        logger.info(f"Fetched {len(orders_df) if orders_df is not None else 0} orders")
+        
         if orders_df is None or orders_df.empty:
             return {"data": []}
         # Filter to open/live if status exists
         if "status" in orders_df.columns:
             orders_df = orders_df[orders_df["status"].isin(["LIVE", "OPEN"])].copy()
+            logger.info(f"Filtered to {len(orders_df)} open/live orders")
         # Ensure target columns exist for safe masking/assignment
         if "market_name" not in orders_df.columns:
             orders_df["market_name"] = ""
         if "outcome" not in orders_df.columns:
             orders_df["outcome"] = ""
-        # API-first enrichment: try assets API by token IDs
-        if "asset_id" in orders_df.columns:
+        
+        # Log the columns we have to debug
+        logger.info(f"Order columns: {list(orders_df.columns)}")
+        
+        # 0) Use existing title column if available (most reliable)
+        if "title" in orders_df.columns and orders_df["title"].notna().any():
+            logger.info("Found title column, using it for market names")
+            orders_df["market_name"] = orders_df["title"].fillna("")
+            logger.info(f"Set {orders_df['title'].notna().sum()} market names from title column")
+        
+        # 1) Assets API by token IDs - this is the secondary method
+        # Look for asset column with different possible names
+        asset_col = None
+        for col in ["asset_id", "asset", "token_id", "tokenId"]:
+            if col in orders_df.columns:
+                asset_col = col
+                break
+        
+        if asset_col:
             try:
-                token_ids = sorted(set(orders_df["asset_id"].dropna().astype(str)))
+                token_ids = sorted(set(orders_df[asset_col].dropna().astype(str)))
+                logger.info(f"Found {len(token_ids)} unique token IDs in column '{asset_col}': {token_ids[:5]}...")
             except Exception:
                 token_ids = []
             if token_ids:
                 tm_f, to_f, _ = _fetch_assets_metadata(token_ids)
+                logger.info(f"Fetched metadata for {len(tm_f)} tokens, {len(to_f)} outcomes")
                 if tm_f:
-                    orders_df["market_name"] = orders_df["market_name"].astype(str)
-                    orders_df["market_name"] = orders_df["asset_id"].astype(str).map(tm_f).fillna(orders_df["market_name"])
+                    orders_df["market_name"] = orders_df[asset_col].astype(str).map(tm_f).fillna(orders_df["market_name"])
+                    logger.info(f"Mapped {orders_df['market_name'].notna().sum()} market names from assets API")
                 if to_f:
-                    orders_df["outcome"] = orders_df["outcome"].astype(str)
-                    orders_df["outcome"] = orders_df["asset_id"].astype(str).map(to_f).fillna(orders_df["outcome"])
-        # Next, try markets API by market IDs for any still-missing names
+                    orders_df["outcome"] = orders_df[asset_col].astype(str).map(to_f).fillna(orders_df["outcome"])
+                    logger.info(f"Mapped {orders_df['outcome'].notna().sum()} outcomes from assets API")
+        else:
+            logger.warning("No asset/token column found in orders data. Available columns: %s", list(orders_df.columns))
+        
+        # 2) Try to use conditionId column if available (this is more reliable)
+        if "conditionId" in orders_df.columns and orders_df["market_name"].eq("").any():
+            missing_conditions = sorted(set(orders_df.loc[orders_df["market_name"].eq("") & orders_df["conditionId"].notna(), "conditionId"].astype(str)))
+            if missing_conditions:
+                logger.info(f"Found conditionId column, fetching market metadata for {len(missing_conditions)} conditions")
+                m2n_f, t2o_f = _fetch_markets_metadata(missing_conditions)
+                if m2n_f:
+                    orders_df.loc[orders_df["market_name"].eq("") & orders_df["conditionId"].notna(), "market_name"] = (
+                        orders_df.loc[orders_df["market_name"].eq("") & orders_df["conditionId"].notna(), "conditionId"].astype(str).map(m2n_f).fillna("")
+                    )
+                    logger.info(f"Updated {len(m2n_f)} market names using conditionId")
+                if t2o_f and asset_col:
+                    mask = orders_df["outcome"].eq("") & orders_df[asset_col].notna()
+                    orders_df.loc[mask, "outcome"] = orders_df.loc[mask, asset_col].astype(str).map(t2o_f).fillna("")
+                    logger.info(f"Updated {len(t2o_f)} outcomes using conditionId")
+        
+        # 3) Markets API by market IDs for any still-missing names (fallback)
         if "market_name" in orders_df.columns and orders_df["market_name"].eq("").any() and "market" in orders_df.columns:
             missing_mids = sorted(set(orders_df.loc[orders_df["market_name"].eq("") & orders_df["market"].notna(), "market"].astype(str)))
             if missing_mids:
+                logger.info(f"Fetching market metadata for {len(missing_mids)} missing markets")
                 m2n_f, t2o_f = _fetch_markets_metadata(missing_mids)
                 if m2n_f:
                     orders_df.loc[orders_df["market_name"].eq("") & orders_df["market"].notna(), "market_name"] = (
                         orders_df.loc[orders_df["market_name"].eq("") & orders_df["market"].notna(), "market"].astype(str).map(m2n_f).fillna("")
                     )
-                if t2o_f and "asset_id" in orders_df.columns:
-                    mask = orders_df["outcome"].eq("") & orders_df["asset_id"].notna()
-                    orders_df.loc[mask, "outcome"] = orders_df.loc[mask, "asset_id"].astype(str).map(t2o_f).fillna("")
-        # Finally, fallback to sheet-based mapping if anything is still blank
+                    logger.info(f"Updated {len(m2n_f)} market names from markets API")
+                if t2o_f and asset_col:
+                    mask = orders_df["outcome"].eq("") & orders_df[asset_col].notna()
+                    orders_df.loc[mask, "outcome"] = orders_df.loc[mask, asset_col].astype(str).map(t2o_f).fillna("")
+                    logger.info(f"Updated {len(t2o_f)} outcomes from markets API")
+        # 4) Fallback to sheet-based mappings
         t2m, t2o, m2n = _build_metadata_maps()
-        if "asset_id" in orders_df.columns:
-            mask = orders_df["market_name"].eq("") & orders_df["asset_id"].notna()
+        logger.info(f"Built fallback maps: {len(t2m)} token->market, {len(t2o)} token->outcome, {len(m2n)} market->name")
+        if asset_col:
+            mask = orders_df["market_name"].eq("") & orders_df[asset_col].notna()
             if mask.any():
                 orders_df.loc[mask, "market_name"] = orders_df.loc[mask, "asset_id"].astype(str).map(t2m).fillna(orders_df.loc[mask, "market_name"])
             mask_out = orders_df["outcome"].eq("") & orders_df["asset_id"].notna()
@@ -608,7 +653,14 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
         if "market" in orders_df.columns:
             mask = orders_df["market_name"].eq("") & orders_df["market"].notna()
             if mask.any():
-                orders_df.loc[mask, "market_name"] = orders_df.loc[mask, "market"].astype(str).map(m2n).fillna(orders_df.loc[mask, "market_name"]) 
+                orders_df.loc[mask, "market_name"] = orders_df.loc[mask, "market"].astype(str).map(m2n).fillna(orders_df.loc[mask, "market_name"])
+                logger.info(f"Filled {mask.sum()} missing market names from market IDs")
+        
+        total_orders = len(orders_df)
+        orders_with_names = orders_df["market_name"].notna().sum()
+        orders_with_outcomes = orders_df["outcome"].notna().sum()
+        logger.info(f"Final enrichment results: {orders_with_names}/{total_orders} orders have market names, {orders_with_outcomes}/{total_orders} have outcomes")
+        
         # Normalize fields commonly used
         wanted = [
             "id",
@@ -621,10 +673,78 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
             "status",
             "created_at",
         ]
-        return {"data": _df_to_records(orders_df, wanted)}
+        result = {"data": _df_to_records(orders_df, wanted)}
+        logger.info(f"Returning {len(result['data'])} enriched orders")
+        return result
     except Exception as exc:
         logger.exception("Error fetching open orders: %s", str(exc))
         raise HTTPException(status_code=500, detail="Failed to fetch orders")
+
+
+@app.get("/api/orders/debug")
+def get_orders_debug(user=Depends(require_user)) -> Dict[str, Any]:
+    """Debug endpoint to see raw order data and metadata mapping process."""
+    client = _ensure_client()
+    try:
+        orders_df = client.get_all_orders()
+        debug_info = {
+            "total_orders": len(orders_df) if orders_df is not None else 0,
+            "columns": list(orders_df.columns) if orders_df is not None else [],
+            "sample_data": []
+        }
+        
+        if orders_df is not None and not orders_df.empty:
+            # Filter to open/live if status exists
+            if "status" in orders_df.columns:
+                orders_df = orders_df[orders_df["status"].isin(["LIVE", "OPEN"])].copy()
+                debug_info["filtered_orders"] = len(orders_df)
+            
+            # Show first few rows for debugging
+            for i, row in orders_df.head(3).iterrows():
+                debug_info["sample_data"].append({
+                    "index": i,
+                    "id": str(row.get("id", "")),
+                    "asset_id": str(row.get("asset_id", "")),
+                    "market": str(row.get("market", "")),
+                    "side": str(row.get("side", "")),
+                    "price": row.get("price", ""),
+                    "size": row.get("original_size", "")
+                })
+            
+            # Test metadata fetching
+            asset_col = None
+            for col in ["asset_id", "asset", "token_id", "tokenId"]:
+                if col in orders_df.columns:
+                    asset_col = col
+                    break
+            
+            if asset_col:
+                token_ids = sorted(set(orders_df[asset_col].dropna().astype(str)))[:5]  # First 5 tokens
+                debug_info["test_token_ids"] = token_ids
+                debug_info["asset_column_used"] = asset_col
+                
+                # Test assets API
+                tm_f, to_f, _ = _fetch_assets_metadata(token_ids)
+                debug_info["assets_api_results"] = {
+                    "market_names": dict(list(tm_f.items())[:3]),  # First 3 results
+                    "outcomes": dict(list(to_f.items())[:3])
+                }
+                
+                # Test sheet mappings
+                t2m, t2o, m2n = _build_metadata_maps()
+                debug_info["sheet_mappings"] = {
+                    "token_to_market": dict(list(t2m.items())[:3]),
+                    "token_to_outcome": dict(list(t2o.items())[:3]),
+                    "market_to_name": dict(list(m2n.items())[:3])
+                }
+            else:
+                debug_info["asset_column_used"] = "None found"
+                debug_info["available_columns"] = list(orders_df.columns)
+        
+        return debug_info
+    except Exception as exc:
+        logger.exception("Error in orders debug endpoint: %s", str(exc))
+        raise HTTPException(status_code=500, detail="Failed to fetch orders debug info")
 
 
 @app.get("/api/positions/debug")
