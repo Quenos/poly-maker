@@ -21,8 +21,17 @@ class OrderRecord:
 class StateStore:
     """Thread-safe sqlite-backed store for orders, fills, and positions."""
 
-    def __init__(self, db_path: str = "mm_state.db", metrics_port: int = 9108) -> None:
+    def __init__(self, db_path: str = None, metrics_port: int = 9108) -> None:
         self._lock = threading.RLock()
+        
+        # Use data folder as default location for database
+        if db_path is None:
+            # Get the project root directory (parent of mm folder)
+            project_root = Path(__file__).parent.parent
+            data_dir = project_root / "data"
+            data_dir.mkdir(exist_ok=True)  # Ensure data folder exists
+            db_path = str(data_dir / "mm_state.db")
+        
         self._db_path = Path(db_path)
         self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL;")

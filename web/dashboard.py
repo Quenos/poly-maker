@@ -168,6 +168,7 @@ def _build_metadata_maps() -> Tuple[Dict[str, str], Dict[str, str], Dict[str, st
         _ensure_sheet_loaded()
         df = getattr(global_state, "df", None)
         if df is not None and not df.empty:  # type: ignore[attr-defined]
+            logger.info(f"Building metadata maps from sheet with {len(df)} rows")
             # Expected columns: question, condition_id, token1, token2, answer1, answer2
             for _, r in df.iterrows():
                 q = str(r.get("question", ""))
@@ -184,7 +185,12 @@ def _build_metadata_maps() -> Tuple[Dict[str, str], Dict[str, str], Dict[str, st
                 if t2:
                     token_to_market[t2] = q
                     token_to_outcome[t2] = a2
-    except Exception:
+            
+            logger.info(f"Built maps: {len(token_to_market)} token->market, {len(token_to_outcome)} token->outcome, {len(market_to_name)} market->name")
+        else:
+            logger.warning("No sheet data available for building metadata maps")
+    except Exception as e:
+        logger.warning(f"Error building metadata maps: {e}")
         # Keep empty maps if df unavailable
         pass
 
@@ -316,16 +322,22 @@ def _fetch_assets_metadata(
                 continue
 
     if not token_ids:
+        logger.warning("No token IDs provided to _fetch_assets_metadata")
         return token_to_market_name, token_to_outcome, token_to_market_id
 
     ids_param = ",".join(sorted(set([str(x) for x in token_ids if x])))
+    logger.info(f"Fetching assets metadata for {len(token_ids)} tokens from Polymarket APIs")
+    
     for base in [
         "https://clob.polymarket.com/assets?ids=",
         "https://data-api.polymarket.com/assets?ids=",
     ]:
         try:
-            resp = requests.get(base + ids_param, headers=headers, timeout=10)
+            url = base + ids_param
+            logger.debug(f"Trying API: {url}")
+            resp = requests.get(url, headers=headers, timeout=10)
             if not resp.ok:
+                logger.warning(f"API request failed: {base} - Status: {resp.status_code}")
                 continue
             data = resp.json()
             items: List[Dict[str, Any]]
@@ -335,10 +347,15 @@ def _fetch_assets_metadata(
                 items = data
             else:
                 items = [data]
+            
+            logger.debug(f"Received {len(items)} items from {base}")
             harvest(items)
+            
             if token_to_market_name:
+                logger.info(f"Successfully fetched metadata from {base}: {len(token_to_market_name)} market names, {len(token_to_outcome)} outcomes")
                 break
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Error fetching from {base}: {e}")
             continue
 
     # If we learned market IDs but not names, try to fetch names
@@ -346,11 +363,14 @@ def _fetch_assets_metadata(
         mid for tid, mid in token_to_market_id.items() if tid in token_to_market_name and not token_to_market_name.get(tid)
     ]))
     if unresolved_mids:
+        logger.info(f"Fetching market names for {len(unresolved_mids)} unresolved market IDs")
         m2n, _ = _fetch_markets_metadata(unresolved_mids)
         for tid, mid in token_to_market_id.items():
             if tid not in token_to_market_name and mid in m2n:
                 token_to_market_name[tid] = m2n[mid]
+                logger.debug(f"Resolved market name for token {tid}: {m2n[mid]}")
 
+    logger.info(f"Final assets metadata results: {len(token_to_market_name)} market names, {len(token_to_outcome)} outcomes, {len(token_to_market_id)} market IDs")
     return token_to_market_name, token_to_outcome, token_to_market_id
 
 
@@ -527,11 +547,74 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
         raise HTTPException(status_code=500, detail="Failed to fetch orders")
 
 
+@app.get("/api/positions/debug")
+def get_positions_debug(user=Depends(require_user)) -> Dict[str, Any]:
+    """Debug endpoint to see raw position data and metadata mapping process."""
+    client = _ensure_client()
+    try:
+        pos_df = client.get_all_positions()
+        debug_info = {
+            "total_positions": len(pos_df) if pos_df is not None else 0,
+            "columns": list(pos_df.columns) if pos_df is not None else [],
+            "sample_data": []
+        }
+        
+        if pos_df is not None and not pos_df.empty:
+            # Show first few rows for debugging
+            for i, row in pos_df.head(3).iterrows():
+                debug_info["sample_data"].append({
+                    "index": i,
+                    "asset": str(row.get("asset", "")),
+                    "market": str(row.get("market", "")),
+                    "size": row.get("size", ""),
+                    "avgPrice": row.get("avgPrice", ""),
+                    "curPrice": row.get("curPrice", ""),
+                    "percentPnl": row.get("percentPnl", "")
+                })
+            
+            # Test metadata fetching
+            asset_col = None
+            for col in ["asset", "token_id", "tokenId", "asset_id"]:
+                if col in pos_df.columns:
+                    asset_col = col
+                    break
+            
+            if asset_col:
+                token_ids = sorted(set(pos_df[asset_col].dropna().astype(str)))[:5]  # First 5 tokens
+                debug_info["test_token_ids"] = token_ids
+                debug_info["asset_column_used"] = asset_col
+                
+                # Test assets API
+                tm_f, to_f, _ = _fetch_assets_metadata(token_ids)
+                debug_info["assets_api_results"] = {
+                    "market_names": dict(list(tm_f.items())[:3]),  # First 3 results
+                    "outcomes": dict(list(to_f.items())[:3])
+                }
+                
+                # Test sheet mappings
+                t2m, t2o, m2n = _build_metadata_maps()
+                debug_info["sheet_mappings"] = {
+                    "token_to_market": dict(list(t2m.items())[:3]),
+                    "token_to_outcome": dict(list(t2o.items())[:3]),
+                    "market_to_name": dict(list(m2n.items())[:3])
+                }
+            else:
+                debug_info["asset_column_used"] = "None found"
+                debug_info["available_columns"] = list(pos_df.columns)
+        
+        return debug_info
+    except Exception as exc:
+        logger.exception("Error in debug endpoint: %s", str(exc))
+        raise HTTPException(status_code=500, detail="Failed to fetch debug info")
+
+
 @app.get("/api/positions")
 def get_positions(user=Depends(require_user)) -> Dict[str, Any]:
     client = _ensure_client()
     try:
         pos_df = client.get_all_positions()
+        logger.info(f"Fetched {len(pos_df) if pos_df is not None else 0} positions")
+        
         # Enrich with market name and outcome (API-first)
         if pos_df is not None and not pos_df.empty:
             # Ensure target columns exist for safe masking/assignment
@@ -539,49 +622,91 @@ def get_positions(user=Depends(require_user)) -> Dict[str, Any]:
                 pos_df["market_name"] = ""
             if "outcome" not in pos_df.columns:
                 pos_df["outcome"] = ""
-            # 1) Assets API by token IDs
-            if "asset" in pos_df.columns:
+            
+            # Log the columns we have to debug
+            logger.info(f"Position columns: {list(pos_df.columns)}")
+            
+            # 1) Assets API by token IDs - this is the primary method
+            # Look for asset column with different possible names
+            asset_col = None
+            for col in ["asset", "token_id", "tokenId", "asset_id"]:
+                if col in pos_df.columns:
+                    asset_col = col
+                    break
+            
+            if asset_col:
                 try:
-                    token_ids = sorted(set(pos_df["asset"].dropna().astype(str)))
-                except Exception:
-                    token_ids = []
-                if token_ids:
-                    tm_f, to_f, _ = _fetch_assets_metadata(token_ids)
-                    if tm_f:
-                        pos_df["market_name"] = pos_df.get("market_name", "")
-                        pos_df["market_name"] = pos_df.get("asset").astype(str).map(tm_f).fillna(pos_df.get("market_name", ""))
-                    if to_f:
-                        pos_df["outcome"] = pos_df.get("outcome", "")
-                        pos_df["outcome"] = pos_df.get("asset").astype(str).map(to_f).fillna(pos_df.get("outcome", ""))
+                    token_ids = sorted(set(pos_df[asset_col].dropna().astype(str)))
+                    logger.info(f"Found {len(token_ids)} unique token IDs in column '{asset_col}': {token_ids[:5]}...")
+                    
+                    if token_ids:
+                        tm_f, to_f, _ = _fetch_assets_metadata(token_ids)
+                        logger.info(f"Fetched metadata for {len(tm_f)} tokens, {len(to_f)} outcomes")
+                        
+                        if tm_f:
+                            # Map market names using token IDs
+                            pos_df["market_name"] = pos_df[asset_col].astype(str).map(tm_f).fillna("")
+                            logger.info(f"Mapped {pos_df['market_name'].notna().sum()} market names from assets API")
+                        
+                        if to_f:
+                            # Map outcomes using token IDs
+                            pos_df["outcome"] = pos_df[asset_col].astype(str).map(to_f).fillna("")
+                            logger.info(f"Mapped {pos_df['outcome'].notna().sum()} outcomes from assets API")
+                except Exception as e:
+                    logger.warning(f"Error fetching assets metadata: {e}")
+            else:
+                logger.warning("No asset/token column found in positions data. Available columns: %s", list(pos_df.columns))
 
             # 2) Markets API by market IDs for any still-missing names
             if "market_name" in pos_df.columns and pos_df["market_name"].eq("").any() and "market" in pos_df.columns:
                 missing_mids = sorted(set(pos_df.loc[pos_df["market_name"].eq("") & pos_df["market"].notna(), "market"].astype(str)))
                 if missing_mids:
+                    logger.info(f"Fetching market metadata for {len(missing_mids)} missing markets")
                     m2n_f, t2o_f = _fetch_markets_metadata(missing_mids)
                     if m2n_f:
                         pos_df.loc[pos_df["market_name"].eq("") & pos_df["market"].notna(), "market_name"] = (
                             pos_df.loc[pos_df["market_name"].eq("") & pos_df["market"].notna(), "market"].astype(str).map(m2n_f).fillna("")
                         )
-                    if t2o_f and "asset" in pos_df.columns:
-                        mask = pos_df["outcome"].eq("") & pos_df["asset"].notna()
-                        pos_df.loc[mask, "outcome"] = pos_df.loc[mask, "asset"].astype(str).map(t2o_f).fillna("")
+                        logger.info(f"Updated {len(m2n_f)} market names from markets API")
+                    if t2o_f and asset_col:
+                        mask = pos_df["outcome"].eq("") & pos_df[asset_col].notna()
+                        pos_df.loc[mask, "outcome"] = pos_df.loc[mask, asset_col].astype(str).map(t2o_f).fillna("")
+                        logger.info(f"Updated {len(t2o_f)} outcomes from markets API")
 
             # 3) Fallback to sheet-based mappings
             t2m, t2o, m2n = _build_metadata_maps()
-            if "asset" in pos_df.columns:
-                mask = pos_df["market_name"].eq("") & pos_df["asset"].notna()
+            logger.info(f"Built fallback maps: {len(t2m)} token->market, {len(t2o)} token->outcome, {len(m2n)} market->name")
+            
+            if asset_col:
+                # Fill in missing market names
+                mask = pos_df["market_name"].eq("") & pos_df[asset_col].notna()
                 if mask.any():
-                    pos_df.loc[mask, "market_name"] = pos_df.loc[mask, "asset"].astype(str).map(t2m).fillna(pos_df.loc[mask, "market_name"]) 
-                mask_out = pos_df["outcome"].eq("") & pos_df["asset"].notna()
+                    pos_df.loc[mask, "market_name"] = pos_df.loc[mask, asset_col].astype(str).map(t2m).fillna("")
+                    logger.info(f"Filled {mask.sum()} missing market names from sheet data")
+                
+                # Fill in missing outcomes
+                mask_out = pos_df["outcome"].eq("") & pos_df[asset_col].notna()
                 if mask_out.any():
-                    pos_df.loc[mask_out, "outcome"] = pos_df.loc[mask_out, "asset"].astype(str).map(t2o).fillna(pos_df.loc[mask_out, "outcome"]) 
+                    pos_df.loc[mask_out, "outcome"] = pos_df.loc[mask_out, asset_col].astype(str).map(t2o).fillna("")
+                    logger.info(f"Filled {mask_out.sum()} missing outcomes from sheet data")
+            
             if "market" in pos_df.columns:
+                # Fill in missing market names using market IDs
                 mask = pos_df["market_name"].eq("") & pos_df["market"].notna()
                 if mask.any():
-                    pos_df.loc[mask, "market_name"] = pos_df.loc[mask, "market"].astype(str).map(m2n).fillna(pos_df.loc[mask, "market_name"]) 
+                    pos_df.loc[mask, "market_name"] = pos_df.loc[mask, "market"].astype(str).map(m2n).fillna("")
+                    logger.info(f"Filled {mask.sum()} missing market names from market IDs")
+            
+            # Final logging of results
+            total_positions = len(pos_df)
+            positions_with_names = pos_df["market_name"].notna().sum()
+            positions_with_outcomes = pos_df["outcome"].notna().sum()
+            logger.info(f"Final enrichment results: {positions_with_names}/{total_positions} positions have market names, {positions_with_outcomes}/{total_positions} have outcomes")
+        
         wanted = ["market_name", "outcome", "size", "avgPrice", "curPrice", "percentPnl"]
-        return {"data": _df_to_records(pos_df, wanted)}
+        result = {"data": _df_to_records(pos_df, wanted)}
+        logger.info(f"Returning {len(result['data'])} enriched positions")
+        return result
     except Exception as exc:
         logger.exception("Error fetching positions: %s", str(exc))
         raise HTTPException(status_code=500, detail="Failed to fetch positions")

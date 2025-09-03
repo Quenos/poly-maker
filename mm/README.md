@@ -21,6 +21,8 @@ This module provides a production-oriented market-making daemon for Polymarket b
 - Google Sheets credentials/json and `SPREADSHEET_URL` env configured
 - Polymarket API access (CLOB and Data API)
 
+**Note**: The new Google Sheets-based configuration system requires the same Google Sheets setup as the existing system. If you're already using Google Sheets for market selection, no additional setup is needed.
+
 ### Installation
 ```bash
 cd /Users/coenkuijpers/projects/poly-maker
@@ -30,7 +32,43 @@ python -m pip install -r requirements.txt
 
 ### Configuration
 
-The market making daemon is configured via environment variables. All parameters have sensible defaults but can be customized for your trading strategy.
+The market making daemon now supports **two configuration methods**:
+
+1. **Google Sheets-based Configuration** (Recommended) - All settings managed in a "Settings" worksheet
+2. **Environment Variables** (Legacy) - Traditional .env file configuration
+
+#### 🆕 Google Sheets Configuration (Recommended)
+
+The new system reads most configuration parameters from a **Settings** worksheet in Google Sheets, providing:
+
+- **Centralized Configuration**: All settings in one place
+- **Easy Updates**: Modify settings without restarting the daemon
+- **Team Collaboration**: Share configuration across team members
+- **Better Documentation**: Each setting includes a description
+
+**Setup**:
+```bash
+# Create the Settings worksheet
+python -m mm.setup_settings_sheet
+
+# Test configuration loading
+python -c "from mm.sheet_config import load_config; config = load_config(); print('Success!')"
+```
+
+**Required .env variables** (only secrets):
+```bash
+SPREADSHEET_URL=https://docs.google.com/spreadsheets/d/your-sheet-id
+PK=0x1234567890abcdef...  # Private key (secret)
+BROWSER_ADDRESS=0x1234567890abcdef...  # Wallet address (secret)
+```
+
+**All other settings** are managed in the Google Sheets "Settings" worksheet.
+
+📖 **See `SETTINGS_MIGRATION.md` for detailed migration instructions.**
+
+#### 🔧 Environment Variables (Legacy)
+
+The traditional method using environment variables. All parameters have sensible defaults but can be customized for your trading strategy.
 
 #### Required Environment Variables
 - `SPREADSHEET_URL`: URL of the Google Sheet containing a tab named "Selected Markets" with columns:
@@ -235,6 +273,18 @@ Markets REMOVED: ['old_token']
 - **Real-time Updates**: Monitors sheet changes every 15 minutes
 - **State Integration**: Shares StateStore instance with main daemon
 
+#### Configuration (`mm/sheet_config.py`)
+- **Google Sheets Integration**: Reads configuration from Settings worksheet
+- **Fallback Support**: Environment variables and hard-coded defaults
+- **Type Safety**: Automatic type conversion and validation
+- **Backward Compatibility**: Maintains existing config.py interface
+
+#### Setup Tools (`mm/setup_settings_sheet.py`)
+- **Automated Setup**: Creates Settings worksheet with all parameters
+- **Comprehensive Documentation**: Includes descriptions for each setting
+- **Default Values**: Pre-populates with recommended configurations
+- **Error Handling**: Robust connection and permission checking
+
 ### CLI Tools (`mm/cli.py`)
 
 The market making daemon includes several command-line utilities for data analysis and maintenance operations.
@@ -254,6 +304,14 @@ python -m mm.cli rebuild_positions
 **What it does**: Reconstructs the current position state by analyzing the complete fill history in the database. This is useful when the position tracking gets out of sync or when you need to verify the current state against historical data.
 
 **Output**: Updates the positions table in the database and logs the reconstructed position counts.
+
+#### Setup Settings Sheet
+```bash
+python -m mm.setup_settings_sheet
+```
+**What it does**: Creates or updates the Settings worksheet in Google Sheets with all configuration parameters. This is the first step in migrating from environment variables to Google Sheets-based configuration.
+
+**Output**: Creates a "Settings" worksheet with 25+ configuration parameters organized by category, including descriptions and default values.
 
 ### Market Sheet Creation Tools
 
@@ -573,12 +631,12 @@ pytest -q tests/mm/test_strategy.py
 - **Port Conflicts**: Ensure port 9108 is available for Prometheus metrics
 - **Sheet Access**: Verify Google Sheets API credentials and permissions
 - **WebSocket Issues**: Check network connectivity to CLOB endpoints
-- **Database Errors**: Verify write permissions for `mm_state.db`
+- **Database Errors**: Verify write permissions for `data/mm_state.db`
 
 #### Monitoring
 - **Logs**: Check console output and log files for errors
 - **Metrics**: Monitor Prometheus metrics at `http://localhost:9108`
-- **Database**: Use SQLite tools to inspect `mm_state.db`
+- **Database**: Use SQLite tools to inspect `data/mm_state.db`
 - **Sheet Changes**: Monitor logs for market selection updates
 
 ### License

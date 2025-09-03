@@ -470,3 +470,9 @@ cython_debug/
 
 # unrelated
 docs/notes.md
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+
