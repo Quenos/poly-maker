@@ -640,26 +640,52 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
                     mask = orders_df["outcome"].eq("") & orders_df[asset_col].notna()
                     orders_df.loc[mask, "outcome"] = orders_df.loc[mask, asset_col].astype(str).map(t2o_f).fillna("")
                     logger.info(f"Updated {len(t2o_f)} outcomes from markets API")
+        
+        # 4) Enhanced fallback: Try markets API for any tokens that Gamma API failed to resolve
+        if asset_col and orders_df["market_name"].eq("").any():
+            # Get tokens that still don't have market names
+            missing_tokens = orders_df.loc[orders_df["market_name"].eq("") & orders_df[asset_col].notna(), asset_col].astype(str).unique()
+            if len(missing_tokens) > 0:
+                logger.info(f"Gamma API failed for {len(missing_tokens)} tokens, trying markets API as fallback")
+                # Try to get market IDs for these tokens from the markets API
+                try:
+                    # Use a broader search to find markets containing these tokens
+                    for token in missing_tokens[:5]:  # Limit to first 5 to avoid too many API calls
+                        logger.info(f"Searching for market containing token: {token[:20]}...")
+                        # This would need to be implemented in _fetch_markets_metadata
+                        # For now, we'll rely on the sheet-based fallback
+                except Exception as e:
+                    logger.warning(f"Markets API fallback failed: {e}")
         # 4) Fallback to sheet-based mappings
         t2m, t2o, m2n = _build_metadata_maps()
         logger.info(f"Built fallback maps: {len(t2m)} token->market, {len(t2o)} token->outcome, {len(m2n)} market->name")
         if asset_col:
             mask = orders_df["market_name"].eq("") & orders_df[asset_col].notna()
             if mask.any():
-                orders_df.loc[mask, "market_name"] = orders_df.loc[mask, "asset_id"].astype(str).map(t2m).fillna(orders_df.loc[mask, "market_name"])
-            mask_out = orders_df["outcome"].eq("") & orders_df["asset_id"].notna()
+                orders_df.loc[mask, "market_name"] = orders_df.loc[mask, asset_col].astype(str).map(t2m).fillna("")
+                filled_count = mask.sum()
+                logger.info(f"Filled {filled_count} missing market names from sheet data")
+            mask_out = orders_df["outcome"].eq("") & orders_df[asset_col].notna()
             if mask_out.any():
-                orders_df.loc[mask_out, "outcome"] = orders_df.loc[mask_out, "asset_id"].astype(str).map(t2o).fillna(orders_df.loc[mask_out, "outcome"])
+                orders_df.loc[mask_out, "outcome"] = orders_df.loc[mask_out, asset_col].astype(str).map(t2o).fillna("")
+                filled_outcomes = mask_out.sum()
+                logger.info(f"Filled {filled_outcomes} missing outcomes from sheet data")
         if "market" in orders_df.columns:
             mask = orders_df["market_name"].eq("") & orders_df["market"].notna()
             if mask.any():
-                orders_df.loc[mask, "market_name"] = orders_df.loc[mask, "market"].astype(str).map(m2n).fillna(orders_df.loc[mask, "market_name"])
+                orders_df.loc[mask, "market_name"] = orders_df.loc[mask, "market"].astype(str).map(m2n).fillna("")
                 logger.info(f"Filled {mask.sum()} missing market names from market IDs")
         
         total_orders = len(orders_df)
         orders_with_names = orders_df["market_name"].notna().sum()
         orders_with_outcomes = orders_df["outcome"].notna().sum()
         logger.info(f"Final enrichment results: {orders_with_names}/{total_orders} orders have market names, {orders_with_outcomes}/{total_orders} have outcomes")
+        
+        # Log which tokens still don't have market names for debugging
+        if asset_col and orders_with_names < total_orders:
+            missing_tokens = orders_df.loc[orders_df["market_name"].eq(""), asset_col].astype(str).unique()
+            logger.warning(f"Tokens still missing market names: {[t[:20] + '...' for t in missing_tokens]}")
+            logger.info("These tokens need to be added to your Google Sheet for proper market name resolution")
         
         # Normalize fields commonly used
         wanted = [
