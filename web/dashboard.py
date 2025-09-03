@@ -357,6 +357,60 @@ def _fetch_assets_metadata(
     return token_to_market_name, token_to_outcome, token_to_market_id
 
 
+def _fetch_market_and_token_names_bulk(limit: int = 1000) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Build broad maps from markets APIs:
+    - token_id -> market_name
+    - market_id -> market_name
+
+    Mirrors approach used in list_open_orders.py (bulk markets scan).
+    """
+    headers = {"User-Agent": "poly-maker-dashboard/1.0", "Accept": "application/json"}
+    token_to_market_name: Dict[str, str] = {}
+    market_to_name: Dict[str, str] = {}
+
+    def harvest(markets_json: List[Dict[str, Any]]) -> None:
+        for m in markets_json:
+            try:
+                name = (m.get("question") or m.get("title") or m.get("name") or m.get("slug") or m.get("questionTitle") or "")
+                mid = m.get("id") or m.get("market") or m.get("conditionId")
+                if mid:
+                    market_to_name[str(mid)] = str(name)
+                for key in ("outcomes", "tokens", "outcomeTokens"):
+                    if key in m and isinstance(m[key], list):
+                        for o in m[key]:
+                            if isinstance(o, dict):
+                                tid = o.get("token_id") or o.get("tokenId") or o.get("id")
+                                if tid:
+                                    token_to_market_name[str(tid)] = str(name)
+            except Exception:
+                continue
+
+    urls = [
+        f"https://clob.polymarket.com/markets?limit={limit}",
+        f"https://data-api.polymarket.com/markets?limit={limit}",
+    ]
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=headers, timeout=10)
+            if not resp.ok:
+                continue
+            data = resp.json()
+            items: List[Dict[str, Any]]
+            if isinstance(data, list):
+                items = data
+            elif isinstance(data, dict) and "markets" in data:
+                items = data.get("markets", [])
+            else:
+                items = [data]
+            harvest(items)
+        except Exception:
+            continue
+
+    logger.info(
+        f"Bulk markets map built: {len(token_to_market_name)} token->name, {len(market_to_name)} market->name"
+    )
+    return token_to_market_name, market_to_name
+
 def _fetch_conditions_questions_gamma(condition_ids: List[str]) -> Dict[str, str]:
     """Fetch condition questions by condition ids using Gamma API.
 
@@ -1009,6 +1063,9 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
 
         logger.info(f"Order columns: {list(df.columns)}")
 
+        # First: bulk markets scan to map tokens/markets -> names (as in list_open_orders)
+        t2n_bulk, m2n_bulk = _fetch_market_and_token_names_bulk(limit=1000)
+
         # Try enrich via assets metadata using token/asset column
         asset_col: Optional[str] = None
         for c in ("token_id", "asset_id", "tokenId", "assetId", "asset"):
@@ -1023,6 +1080,11 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
             except Exception:
                 token_ids = []
             if token_ids:
+                # Apply bulk token->name first
+                if t2n_bulk:
+                    df["market_name"] = df[asset_col].astype(str).map(t2n_bulk).fillna(df["market_name"])  # type: ignore[arg-type]
+                    logger.info("Applied bulk token->name map to orders")
+
                 tm_map, to_map, _ = _fetch_assets_metadata(token_ids)
                 logger.info(f"Assets metadata returned {len(tm_map)} names, {len(to_map)} outcomes")
                 if tm_map:
@@ -1071,6 +1133,13 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
                             df.loc[mask_empty, "market_name"] = df.loc[mask_empty, asset_col].astype(str).map(token_to_name_direct).fillna("")
                             logger.info(f"Filled market names for {int(mask_empty.sum())} orders via direct assets API")
 
+        # Also apply bulk market_id -> name mapping
+        if "market" in df.columns and m2n_bulk and df["market_name"].eq("").any():
+            mask = df["market_name"].eq("") & df["market"].notna()
+            if mask.any():
+                df.loc[mask, "market_name"] = df.loc[mask, "market"].astype(str).map(m2n_bulk).fillna("")
+                logger.info("Applied bulk market_id->name map to orders")
+
         # Fallback: fetch by market/condition id if available
         if ("market_name" in df.columns) and df["market_name"].eq("").any():
             mid_col: Optional[str] = None
@@ -1086,6 +1155,20 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
                     if m2n:
                         mask = df["market_name"].eq("") & df[mid_col].notna()
                         df.loc[mask, "market_name"] = df.loc[mask, mid_col].astype(str).map(m2n).fillna("")
+
+        # Use title column if present
+        if "title" in df.columns and df["market_name"].eq("").any():
+            mask_title = df["market_name"].eq("") & df["title"].notna()
+            if mask_title.any():
+                df.loc[mask_title, "market_name"] = df.loc[mask_title, "title"].astype(str)
+                logger.info(f"Filled {int(mask_title.sum())} market names from title column")
+
+        # Final fallback: fill with market id
+        if "market" in df.columns and df["market_name"].eq("").any():
+            mask_mid = df["market_name"].eq("") & df["market"].notna()
+            if mask_mid.any():
+                df.loc[mask_mid, "market_name"] = df.loc[mask_mid, "market"].astype(str)
+                logger.info(f"Filled {int(mask_mid.sum())} market names with market id fallback")
 
         # Prepare output
         wanted = [
