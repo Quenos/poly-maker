@@ -144,3 +144,105 @@ def should_requote(
         return True
     return False
 
+
+@dataclass
+class StrategyState:
+    fair: float
+    sigma: float
+    inventory_usd: float
+    bankroll_usd: float
+    time_to_resolution_sec: float
+    tick: float = 0.01
+
+
+@dataclass
+class QuotesOut:
+    yes_bid: float
+    yes_ask: float
+    no_bid: float
+    no_ask: float
+    size_multiplier: float
+
+
+class AdvancedAvellanedaStrategy:
+    def __init__(self, k_vol: float, k_fee_ticks: float, inv_gamma: float, min_spread_ticks: int = 1) -> None:
+        self.k_vol = k_vol
+        self.k_fee_ticks = k_fee_ticks
+        self.base_gamma = inv_gamma
+        self.min_spread_ticks = min_spread_ticks
+
+    @staticmethod
+    def _event_scalers(time_to_resolution_sec: float) -> tuple[float, float, float]:
+        # Returns (h_multiplier, gamma_multiplier, size_multiplier)
+        hrs = max(0.0, time_to_resolution_sec) / 3600.0
+        if hrs <= 1:
+            return (2.0, 2.0, 0.25)
+        if hrs <= 4:
+            return (1.7, 1.7, 0.4)
+        if hrs <= 12:
+            return (1.5, 1.5, 0.6)
+        if hrs <= 48:
+            return (1.2, 1.2, 0.8)
+        return (1.0, 1.0, 1.0)
+
+    @staticmethod
+    def _apply_caps(gamma: float, h: float, q_norm: float, soft_cap: float, hard_cap: float) -> tuple[float, float, float]:
+        size_mult = 1.0
+        if abs(q_norm) >= soft_cap:
+            gamma *= 1.2
+            h *= 1.2
+            size_mult *= 0.7
+        if abs(q_norm) >= hard_cap:
+            gamma *= 1.5
+            h *= 1.5
+            size_mult *= 0.1
+        return gamma, h, size_mult
+
+    def compute_quotes(
+        self,
+        state: StrategyState,
+        soft_cap: float,
+        hard_cap: float,
+    ) -> QuotesOut:
+        q_norm = 0.0
+        if state.bankroll_usd > 0:
+            q_norm = state.inventory_usd / state.bankroll_usd
+
+        # Base spread and gamma
+        h = self.k_vol * state.sigma + self.k_fee_ticks * state.tick
+        # Enforce minimum spread in ticks
+        min_h = self.min_spread_ticks * state.tick
+        if h < min_h:
+            h = min_h
+        gamma = self.base_gamma
+
+        # Event-time scalers
+        h_mult, g_mult, size_mult_ev = self._event_scalers(state.time_to_resolution_sec)
+        h *= h_mult
+        gamma *= g_mult
+
+        # Inventory caps
+        gamma, h, size_mult_caps = self._apply_caps(gamma, h, q_norm, soft_cap, hard_cap)
+        size_mult = size_mult_ev * size_mult_caps
+
+        # Reservation price shift
+        delta_r = -gamma * q_norm
+
+        yes_bid = max(0.01, min(0.99, state.fair + delta_r - h))
+        yes_ask = max(0.01, min(0.99, state.fair + delta_r + h))
+
+        # Jitter one tick both sides (symmetric; caller can add time jitter externally)
+        j = (random.random() - 0.5) * 2.0 * state.tick
+        yes_bid = max(0.01, min(0.99, yes_bid + j))
+        yes_ask = max(0.01, min(0.99, yes_ask - j))
+
+        # Parity for NO, avoid self-cross after fees
+        no_bid = max(0.01, min(0.99, 1.0 - yes_ask))
+        no_ask = max(0.01, min(0.99, 1.0 - yes_bid))
+        if no_bid >= no_ask:
+            mid_no = (no_bid + no_ask) / 2.0
+            no_bid = max(0.01, mid_no - state.tick)
+            no_ask = min(0.99, mid_no + state.tick)
+
+        return QuotesOut(yes_bid=yes_bid, yes_ask=yes_ask, no_bid=no_bid, no_ask=no_ask, size_multiplier=size_mult)
+

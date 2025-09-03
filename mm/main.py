@@ -5,6 +5,7 @@ from typing import Dict, List
 import time
 import os
 from datetime import datetime
+import signal
 
 import pandas as pd
 import requests
@@ -13,7 +14,9 @@ from mm.config import load_config
 from mm.market_data import MarketData
 from mm.orders import OrdersClient
 from mm.state import StateStore
-from mm.strategy import AvellanedaLite, build_layered_quotes, apply_inventory_risk, should_requote
+from mm.strategy import AvellanedaLite, build_layered_quotes, should_requote
+from mm.risk import RiskManager
+from mm.selection import SelectionManager
 from store_selected_markets import read_sheet
 from poly_utils.google_utils import get_spreadsheet
 
@@ -25,6 +28,53 @@ def _to_float(x) -> float:
     try:
         return float(x)
     except Exception:
+        return 0.0
+
+
+def _fetch_positions_by_token(address: str) -> Dict[str, float]:
+    """Fetch current positions via Data-API and return token_id -> shares (float)."""
+    out: Dict[str, float] = {}
+    try:
+        url = f"https://data-api.polymarket.com/positions?user={address}"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        arr = resp.json() or []
+        for row in arr:
+            token = str(row.get("token_id") or row.get("asset_id") or row.get("id") or "").strip()
+            if not token:
+                continue
+            shares = row.get("shares")
+            if shares is None:
+                shares = row.get("balance") or row.get("qty") or 0.0
+            try:
+                val = float(shares)
+            except Exception:
+                val = 0.0
+            out[token] = val
+    except Exception:
+        logger.exception("Failed to fetch positions for %s", address)
+    return out
+
+
+def _fetch_nav_usd(address: str) -> float:
+    try:
+        url = f"https://data-api.polymarket.com/value?user={address}"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        body = resp.json()
+        if isinstance(body, dict):
+            return float(body.get("value") or 0.0)
+        if isinstance(body, list) and body:
+            first = body[0]
+            if isinstance(first, dict) and "value" in first:
+                return float(first.get("value") or 0.0)
+            try:
+                return float(first)
+            except Exception:
+                return 0.0
+        return 0.0
+    except Exception:
+        logger.exception("Failed to fetch NAV for %s", address)
         return 0.0
 
 
@@ -129,6 +179,11 @@ async def main_async(test_mode: bool = False) -> None:
 
     cfg = load_config()
     state = StateStore()
+    risk = RiskManager(
+        soft_cap_delta_pct=cfg.soft_cap_delta_pct,
+        hard_cap_delta_pct=cfg.hard_cap_delta_pct,
+        daily_loss_limit_pct=cfg.daily_loss_limit_pct,
+    )
 
     # Read Selected Markets
     ss = get_spreadsheet(read_only=False)
@@ -169,12 +224,23 @@ async def main_async(test_mode: bool = False) -> None:
 
     # Market data
     md = MarketData(cfg.clob_ws_url, cfg.clob_base_url)
-    if token_ids:
-        md.backfill_prices(token_ids)
-        ws_task = asyncio.create_task(md.run_ws(token_ids))
-    else:
-        logger.warning("No token_ids derived from Selected Markets/Gamma; skipping WS subscription")
-        ws_task = None
+    ws_task: asyncio.Task | None = None
+
+    def _restart_ws(tokens: List[str]) -> None:
+        nonlocal ws_task
+        if ws_task is not None:
+            try:
+                ws_task.cancel()
+            except Exception:
+                pass
+            ws_task = None
+        if tokens:
+            md.backfill_prices(tokens)
+            ws_task = asyncio.create_task(md.run_ws(tokens))
+        else:
+            logger.warning("No token_ids derived; skipping WS subscription")
+
+    _restart_ws(token_ids)
 
     # Orders client (dry-run in test mode)
     if test_mode:
@@ -206,8 +272,109 @@ async def main_async(test_mode: bool = False) -> None:
     # Main loop: compute quotes and place layered orders (skeleton)
     last_quote_ts: Dict[str, float] = {}
     last_mid_seen: Dict[str, float] = {}
+    halt_event = asyncio.Event()
+
+    # Selection supervisor (15 min re-pull)
+    sel = SelectionManager(cfg.gamma_base_url, state_store=state)
+    
+    # Log initial market selection
+    initial_tokens, _ = sel.pull()
+    logger.info("🎯 Initial market selection: %d markets loaded from sheet", len(initial_tokens))
+    if initial_tokens:
+        logger.info("Initial markets: %s", initial_tokens[:5])  # Show first 5 for brevity
+        if len(initial_tokens) > 5:
+            logger.info("... and %d more markets", len(initial_tokens) - 5)
+
+    async def selection_loop() -> None:
+        nonlocal token_ids, token_to_market, strategies
+        logger.info("Selection loop started - checking for market changes every 15 minutes")
+        while not halt_event.is_set():
+            try:
+                to_add, to_remove = sel.tick()
+                if to_add or to_remove:
+                    logger.info("🔄 MARKET SELECTION CHANGE DETECTED - Updating trading configuration")
+                    logger.info("Previous active markets: %d", len(token_ids))
+                    
+                    # Update tokens and subscriptions
+                    token_ids = sel.active_tokens
+                    logger.info("New active markets: %d", len(token_ids))
+                    
+                    # Re-enrich to capture latest condition ids
+                    _, enr = sel.pull()
+                    old_market_count = len(token_to_market)
+                    token_to_market.clear()
+                    cond_col2 = "condition_id" if "condition_id" in enr.columns else ("conditionId" if "conditionId" in enr.columns else None)
+                    if cond_col2 is not None:
+                        for _, row in enr.iterrows():
+                            mhex = str(row.get(cond_col2) or "").strip()
+                            if not mhex:
+                                continue
+                            for tc in ("token1", "token2"):
+                                if tc in enr.columns:
+                                    tval = str(row.get(tc) or "").strip()
+                                    if tval:
+                                        token_to_market[tval] = mhex
+                    
+                    logger.info("Market mappings: %d -> %d", old_market_count, len(token_to_market))
+                    
+                    # Restart websocket subscriptions
+                    logger.info("Restarting websocket subscriptions for %d tokens", len(token_ids))
+                    _restart_ws(token_ids)
+                    
+                    # Ensure strategies exist for all tokens
+                    new_strategies = 0
+                    for t in token_ids:
+                        if t not in strategies:
+                            strategies[t] = AvellanedaLite(
+                                alpha_fair=cfg.alpha_fair,
+                                k_vol=cfg.k_vol,
+                                k_fee_ticks=cfg.k_fee_ticks,
+                                inv_gamma=cfg.inv_gamma,
+                            )
+                            new_strategies += 1
+                    
+                    if new_strategies > 0:
+                        logger.info("Created %d new trading strategies", new_strategies)
+                    
+                    # Log summary of changes
+                    logger.info("✅ Market selection update complete:")
+                    logger.info("   - Active markets: %d", len(token_ids))
+                    logger.info("   - Market mappings: %d", len(token_to_market))
+                    logger.info("   - Trading strategies: %d", len(strategies))
+                else:
+                    logger.debug("No market selection changes detected")
+                
+                # Log periodic status every hour (4th check)
+                if (time.time() - sel.ts) > 3600:  # 1 hour since last change
+                    logger.info("📊 Selection status: %d active markets, %d strategies, %d market mappings", 
+                               len(token_ids), len(strategies), len(token_to_market))
+                
+                await asyncio.sleep(900)  # 15 minutes
+            except Exception:
+                logger.exception("Selection loop error")
+                await asyncio.sleep(30)
+
+    # Config hot-reload (SIGHUP)
+    def _on_sighup() -> None:
+        try:
+            _ = load_config()
+            logger.info("Config reloaded on SIGHUP")
+        except Exception:
+            logger.exception("Config reload failed")
+
+    try:
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGHUP, _on_sighup)
+    except Exception:
+        pass
+    sel_task = asyncio.create_task(selection_loop())
     try:
         while True:
+            # Pull live positions and NAV for inventory-aware quoting
+            wallet = os.getenv("BROWSER_ADDRESS", "")
+            positions_by_token = _fetch_positions_by_token(wallet) if wallet else {}
+            nav_usd = _fetch_nav_usd(wallet) if wallet else 0.0
+
             for token in token_ids:
                 market_id = token_to_market.get(token)
                 if not market_id:
@@ -216,9 +383,11 @@ async def main_async(test_mode: bool = False) -> None:
                 book = md.books.get(market_id)
                 if not book:
                     continue
-                # Inventory norm: placeholder 0 for now; integrate from state later
-                q_norm = 0.0
-                q = strategies[token].compute_quote(book, q_norm)
+                # Inventory-aware: estimate inventory_usd from shares * mid
+                shares = positions_by_token.get(token, 0.0)
+                mid = book.mid() or 0.0
+                inventory_usd = shares * mid
+                q = strategies[token].compute_quote(book, 0.0)
                 if q is None:
                     continue
                 mid_now = book.mid()
@@ -236,12 +405,27 @@ async def main_async(test_mode: bool = False) -> None:
                     base_size=cfg.base_size_usd,
                     max_size=cfg.max_size_usd,
                 )
-                lq = apply_inventory_risk(
-                    quotes=lq,
-                    inventory_norm=q_norm,
-                    soft_cap=cfg.soft_cap_delta_pct,
-                    hard_cap=cfg.hard_cap_delta_pct,
+                # Apply risk manager multipliers to spreads/gamma at the strategy level if using advanced
+                adj = risk.apply(
+                    state=type("S", (), {
+                        "fair": mid_now or mid,
+                        "sigma": 0.0,
+                        "inventory_usd": inventory_usd,
+                        "bankroll_usd": nav_usd if nav_usd > 0 else 1.0,
+                        "time_to_resolution_sec": 24 * 3600.0,
+                        "tick": 0.01,
+                    })(),
+                    token_id=token,
+                    nav_usd=nav_usd,
                 )
+                # Reflect size multiplier from risk
+                if adj.size_multiplier != 1.0:
+                    lq = type(lq)(
+                        bid_prices=lq.bid_prices,
+                        ask_prices=lq.ask_prices,
+                        sizes=[s * adj.size_multiplier for s in lq.sizes],
+                        timestamp=lq.timestamp,
+                    )
                 logger.info(
                     "Quoting token=%s market=%s mid=%.4f bid=%.4f ask=%.4f layers=%d",
                     token,
@@ -265,6 +449,11 @@ async def main_async(test_mode: bool = False) -> None:
                     logger.exception("Order placement failed for token %s", token)
             await asyncio.sleep(1.0)
     finally:
+        halt_event.set()
+        try:
+            sel_task.cancel()
+        except Exception:
+            pass
         if ws_task is not None:
             ws_task.cancel()
             try:
