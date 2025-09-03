@@ -155,7 +155,7 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 def _build_metadata_maps() -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
     """
-    Build maps for enriching rows with market name and outcome using existing state.
+    Build maps for enriching rows with market name and outcome using the Selected Markets sheet.
 
     Returns:
         token_to_market_name, token_to_outcome, market_to_name
@@ -168,7 +168,7 @@ def _build_metadata_maps() -> Tuple[Dict[str, str], Dict[str, str], Dict[str, st
         _ensure_sheet_loaded()
         df = getattr(global_state, "df", None)
         if df is not None and not df.empty:  # type: ignore[attr-defined]
-            logger.info(f"Building metadata maps from sheet with {len(df)} rows")
+            logger.info(f"Building metadata maps from Selected Markets sheet with {len(df)} rows")
             logger.info(f"Sheet columns: {list(df.columns)}")
             
             # Try different column name variations
@@ -218,7 +218,7 @@ def _build_metadata_maps() -> Tuple[Dict[str, str], Dict[str, str], Dict[str, st
                     token_to_market[t2] = q
                     token_to_outcome[t2] = a2
             
-            logger.info(f"Built maps: {len(token_to_market)} token->market, {len(token_to_outcome)} token->outcome, {len(market_to_name)} market->name")
+            logger.info(f"Built maps from Selected Markets sheet: {len(token_to_market)} token->market, {len(token_to_outcome)} token->outcome, {len(market_to_name)} market->name")
             
             # Log some sample mappings for debugging
             if token_to_market:
@@ -229,9 +229,9 @@ def _build_metadata_maps() -> Tuple[Dict[str, str], Dict[str, str], Dict[str, st
                 logger.info(f"Sample market->name mappings: {sample_markets}")
                 
         else:
-            logger.warning("No sheet data available for building metadata maps")
+            logger.warning("No Selected Markets sheet data available for building metadata maps")
     except Exception as e:
-        logger.warning(f"Error building metadata maps: {e}")
+        logger.warning(f"Error building metadata maps from Selected Markets sheet: {e}")
         # Keep empty maps if df unavailable
         pass
 
@@ -653,23 +653,23 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
                     for token in missing_tokens[:5]:  # Limit to first 5 to avoid too many API calls
                         logger.info(f"Searching for market containing token: {token[:20]}...")
                         # This would need to be implemented in _fetch_markets_metadata
-                        # For now, we'll rely on the sheet-based fallback
+                        # For now, we'll rely on the Selected Markets sheet fallback
                 except Exception as e:
                     logger.warning(f"Markets API fallback failed: {e}")
-        # 4) Fallback to sheet-based mappings
+        # 4) Fallback to Selected Markets sheet mappings
         t2m, t2o, m2n = _build_metadata_maps()
-        logger.info(f"Built fallback maps: {len(t2m)} token->market, {len(t2o)} token->outcome, {len(m2n)} market->name")
+        logger.info(f"Built fallback maps from Selected Markets sheet: {len(t2m)} token->market, {len(t2o)} token->outcome, {len(m2n)} market->name")
         if asset_col:
             mask = orders_df["market_name"].eq("") & orders_df[asset_col].notna()
             if mask.any():
                 orders_df.loc[mask, "market_name"] = orders_df.loc[mask, asset_col].astype(str).map(t2m).fillna("")
                 filled_count = mask.sum()
-                logger.info(f"Filled {filled_count} missing market names from sheet data")
+                logger.info(f"Filled {filled_count} missing market names from Selected Markets sheet")
             mask_out = orders_df["outcome"].eq("") & orders_df[asset_col].notna()
             if mask_out.any():
                 orders_df.loc[mask_out, "outcome"] = orders_df.loc[mask_out, asset_col].astype(str).map(t2o).fillna("")
                 filled_outcomes = mask_out.sum()
-                logger.info(f"Filled {filled_outcomes} missing outcomes from sheet data")
+                logger.info(f"Filled {filled_outcomes} missing outcomes from Selected Markets sheet")
         if "market" in orders_df.columns:
             mask = orders_df["market_name"].eq("") & orders_df["market"].notna()
             if mask.any():
@@ -685,7 +685,7 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
         if asset_col and orders_with_names < total_orders:
             missing_tokens = orders_df.loc[orders_df["market_name"].eq(""), asset_col].astype(str).unique()
             logger.warning(f"Tokens still missing market names: {[t[:20] + '...' for t in missing_tokens]}")
-            logger.info("These tokens need to be added to your Google Sheet for proper market name resolution")
+            logger.info("These tokens need to be added to your Selected Markets sheet for proper market name resolution")
         
         # Normalize fields commonly used
         wanted = [
@@ -709,7 +709,7 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
 
 @app.get("/api/orders/debug")
 def get_orders_debug(user=Depends(require_user)) -> Dict[str, Any]:
-    """Debug endpoint to see raw order data and metadata mapping process."""
+    """Debug endpoint to see raw order data and metadata mapping process from Selected Markets sheet."""
     client = _ensure_client()
     try:
         orders_df = client.get_all_orders()
@@ -775,7 +775,7 @@ def get_orders_debug(user=Depends(require_user)) -> Dict[str, Any]:
 
 @app.get("/api/positions/debug")
 def get_positions_debug(user=Depends(require_user)) -> Dict[str, Any]:
-    """Debug endpoint to see raw position data and metadata mapping process."""
+    """Debug endpoint to see raw position data and metadata mapping process from Selected Markets sheet."""
     client = _ensure_client()
     try:
         pos_df = client.get_all_positions()
@@ -921,22 +921,22 @@ def get_positions(user=Depends(require_user)) -> Dict[str, Any]:
                         pos_df.loc[mask, "outcome"] = pos_df.loc[mask, asset_col].astype(str).map(t2o_f).fillna("")
                         logger.info(f"Updated {len(t2o_f)} outcomes from markets API")
 
-            # 4) Fallback to sheet-based mappings
+            # 4) Fallback to Selected Markets sheet mappings
             t2m, t2o, m2n = _build_metadata_maps()
-            logger.info(f"Built fallback maps: {len(t2m)} token->market, {len(t2o)} token->outcome, {len(m2n)} market->name")
+            logger.info(f"Built fallback maps from Selected Markets sheet: {len(t2m)} token->market, {len(t2o)} token->outcome, {len(m2n)} market->name")
             
             if asset_col:
                 # Fill in missing market names
                 mask = pos_df["market_name"].eq("") & pos_df[asset_col].notna()
                 if mask.any():
                     pos_df.loc[mask, "market_name"] = pos_df.loc[mask, asset_col].astype(str).map(t2m).fillna("")
-                    logger.info(f"Filled {mask.sum()} missing market names from sheet data")
+                    logger.info(f"Filled {mask.sum()} missing market names from Selected Markets sheet")
                 
                 # Fill in missing outcomes
                 mask_out = pos_df["outcome"].eq("") & pos_df[asset_col].notna()
                 if mask_out.any():
                     pos_df.loc[mask_out, "outcome"] = pos_df.loc[mask_out, asset_col].astype(str).map(t2o).fillna("")
-                    logger.info(f"Filled {mask_out.sum()} missing outcomes from sheet data")
+                    logger.info(f"Filled {mask_out.sum()} missing outcomes from Selected Markets sheet")
             
             if "market" in pos_df.columns:
                 # Fill in missing market names using market IDs
@@ -982,7 +982,7 @@ def get_recent_trades(limit: int = 10, page: int = 1, user=Depends(require_user)
                 activity_df["datetime"] = pd.to_datetime(activity_df[ts_col], unit="s", errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
                 activity_df["datetime"] = ""
-        # Enrich with market name and outcome if available
+        # Enrich with market name and outcome if available from Selected Markets sheet
         t2m, t2o, _ = _build_metadata_maps()
         # Prefer 'title'/'outcome' from activity if present
         if "title" in activity_df.columns:
