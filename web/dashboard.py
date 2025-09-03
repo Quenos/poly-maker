@@ -963,3 +963,95 @@ def get_pnl_trades(limit: int = 100, page: int = 1, user=Depends(require_user)) 
     except Exception as exc:
         logger.exception("Error fetching per-trade PnL: %s", str(exc))
         raise HTTPException(status_code=500, detail="Failed to fetch per-trade PnL")
+
+
+@app.get("/api/orders")
+def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
+    """Return open orders with enriched market names and outcomes.
+
+    Fields: market_name, outcome, side, price, original_size, size_matched, status
+    """
+    # Lazy import to avoid hard dependency at module import time
+    try:
+        from py_clob_client.client import ClobClient  # type: ignore
+        from py_clob_client.constants import POLYGON  # type: ignore
+    except Exception as exc:
+        logger.exception("py_clob_client not available: %s", str(exc))
+        raise HTTPException(status_code=500, detail="py_clob_client not installed")
+
+    pk = (os.getenv("PK") or "").strip()
+    funder = (os.getenv("BROWSER_ADDRESS") or os.getenv("BROWSER_WALLET") or "").strip()
+    if not pk or not funder:
+        raise HTTPException(status_code=400, detail="PK and BROWSER_ADDRESS/BROWSER_WALLET must be configured")
+
+    try:
+        client = ClobClient("https://clob.polymarket.com", key=pk, chain_id=POLYGON, funder=funder)
+        creds = client.create_or_derive_api_creds()
+        client.set_api_creds(creds)
+
+        orders = client.get_orders()
+        if not orders:
+            return {"data": []}
+
+        df = pd.DataFrame(orders)
+        # Only active orders
+        if "status" in df.columns:
+            df = df[df["status"].isin(["LIVE", "OPEN"])].copy()
+            if df.empty:
+                return {"data": []}
+
+        # Ensure expected columns exist
+        for col in ("market_name", "outcome", "original_size", "size_matched"):
+            if col not in df.columns:
+                df[col] = "" if col in ("market_name", "outcome") else 0
+
+        # Try enrich via assets metadata using token/asset column
+        asset_col: Optional[str] = None
+        for c in ("token_id", "asset_id", "tokenId", "assetId", "asset"):
+            if c in df.columns:
+                asset_col = c
+                break
+
+        if asset_col is not None:
+            try:
+                token_ids = sorted(set(df[asset_col].dropna().astype(str)))
+            except Exception:
+                token_ids = []
+            if token_ids:
+                tm_map, to_map, _ = _fetch_assets_metadata(token_ids)
+                if tm_map:
+                    df["market_name"] = df[asset_col].astype(str).map(tm_map).fillna(df["market_name"])  # type: ignore[arg-type]
+                if to_map:
+                    df["outcome"] = df[asset_col].astype(str).map(to_map).fillna(df["outcome"])  # type: ignore[arg-type]
+
+        # Fallback: fetch by market/condition id if available
+        if ("market_name" in df.columns) and df["market_name"].eq("").any():
+            mid_col: Optional[str] = None
+            for c in ("market", "conditionId", "id"):
+                if c in df.columns:
+                    mid_col = c
+                    break
+            if mid_col is not None:
+                missing_mids = sorted(set(df.loc[df["market_name"].eq("") & df[mid_col].notna(), mid_col].astype(str)))
+                if missing_mids:
+                    m2n, _ = _fetch_markets_metadata(missing_mids)
+                    if m2n:
+                        mask = df["market_name"].eq("") & df[mid_col].notna()
+                        df.loc[mask, "market_name"] = df.loc[mask, mid_col].astype(str).map(m2n).fillna("")
+
+        # Prepare output
+        wanted = [
+            "market_name",
+            "outcome",
+            "side",
+            "price",
+            "original_size",
+            "size_matched",
+            "status",
+        ]
+        return {"data": _df_to_records(df, wanted)}
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Failed to fetch open orders: %s", str(exc))
+        raise HTTPException(status_code=500, detail="Failed to fetch open orders")
