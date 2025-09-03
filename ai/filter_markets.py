@@ -122,22 +122,26 @@ __all__ = ["get_all_markets", "get_market_name_token_pairs", "remove_markets_to_
 
 def _build_market_filter_prompts(market_titles: list[str]) -> tuple[str, str]:
     """Construct system and user prompts for market filtering."""
-    system_prompt = (
-        "You are an expert prediction market analyst. You will be given a list of Polymarket markets. "
-        "For each market, decide if it is ELIGIBLE for automated market making or should be AVOIDED based on risks like "
-        "illiquidity, insider information, manipulability, ambiguity, or extreme horizon. Be strict in filtering.\n\n"
-        "Rules for Avoidance:\n"
-        "A market should be marked AVOID if:\n"
-        "\t•\tInsider-prone or private knowledge needed\n"
-        "\t•\tVery short horizon (hours / micro-events)\n"
-        "\t•\tAmbiguous or disputable resolution criteria\n"
-        "\t•\tMeme/celebrity/hype-driven\n"
-        "\t•\tMulti-outcome / too complex\n"
-        "\t•\tLong-tail horizon (>6 months)\n"
-        "\t•\tEasily manipulable (cheap to influence outcome)\n\n"
-        "Output format (JSON array):\n\n"
-        "[\n  {\n    \"market\": \"<market title>\",\n    \"decision\": \"AVOID\" | \"ELIGIBLE\",\n    \"reason\": \"short explanation\"\n  },\n  ...\n]\n"
-    )
+    system_prompt = """You are an expert prediction-market analyst. For each market, decide if it is ELIGIBLE for automated market making or should be AVOIDED. 
+Liquidity is checked separately, do not consider it here.
+
+Key rules:
+- SPORTS: ELIGIBLE if major league/tournament winner or match result. Avoid props or niche leagues.
+- ELECTIONS: ELIGIBLE if national/statewide/general elections or balance of power. Avoid only if ambiguous (no clear candidate/ballot definition).
+- CRYPTO/FX/INDEX: ELIGIBLE if price thresholds/ranges with clear reference index or multi-exchange benchmark. Avoid only if source is undefined.
+- GEOPOLITICS/NEWS: ELIGIBLE if explicit resolution source (UN, EU Official Journal, govt press release). Avoid if terms ambiguous.
+- ENTERTAINMENT: ELIGIBLE if box office/grossing with named source. Avoid meme/award/vague criteria.
+- HORIZON: Long horizon (but less than 1 year) is fine unless combined with ambiguity.
+
+Output JSON array:
+[
+  {
+    "market": "<title>",
+    "decision": "ELIGIBLE" | "AVOID",
+    "reason": "tags like [sports, election, crypto, clear-source, ambiguous, prop, vague]",
+    "confidence": 0.0-1.0
+  }
+]"""
 
     lines = ["Markets:"]
     for title in market_titles:
@@ -244,7 +248,7 @@ def remove_markets_to_avoid(pairs_df: pd.DataFrame | None = None,
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
-                    temperature=0.2,
+                    temperature=0.0,
                 )
                 content = (resp.choices[0].message.content or "").strip()
             except Exception:

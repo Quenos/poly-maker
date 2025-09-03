@@ -9,9 +9,10 @@ import numpy as np
 import pandas as pd
 import requests
 from dotenv import load_dotenv
+import re
 
 from data_updater.google_utils import get_spreadsheet
-from store_selected_markets import write_sheet
+from store_selected_markets import write_sheet, read_sheet
 
 
 logger = logging.getLogger(__name__)
@@ -23,6 +24,298 @@ def setup_logging() -> None:
         level=getattr(logging, level, logging.INFO),
         format="%(asctime)s %(levelname)s %(message)s",
     )
+
+
+def clean_token_string(token: str) -> str:
+    """
+    Clean token strings by removing special characters and ensuring they remain as strings.
+    
+    Args:
+        token: Raw token string that may contain special characters
+        
+    Returns:
+        Cleaned token string suitable for Google Sheets (prevents scientific notation)
+    """
+    if not token or not isinstance(token, str):
+        return ""
+    
+    # Remove common special characters that might appear at start/end
+    # This includes quotes, brackets, extra whitespace, etc.
+    cleaned = token.strip()
+    
+    # Remove quotes, brackets, and other common delimiters
+    cleaned = re.sub(r'^["\'\[\](){}]+', '', cleaned)
+    cleaned = re.sub(r'["\'\[\](){}]+$', '', cleaned)
+    
+    # Remove any remaining special characters that aren't alphanumeric
+    # Keep only digits and letters (token IDs should be hex strings)
+    cleaned = re.sub(r'[^a-zA-Z0-9]', '', cleaned)
+    
+    # Ensure it's a valid token ID (should be a long hex string)
+    if len(cleaned) < 10:  # Token IDs are typically very long
+        return ""
+    
+    # Force to string and ensure it's not empty
+    result = str(cleaned).strip()
+    return result if result else ""
+
+
+def check_market_size_criteria(market_row: pd.Series) -> bool:
+    """
+    Check if a market meets the minimum market size criteria.
+    Markets that don't meet these criteria should be removed even if currently traded.
+    
+    Args:
+        market_row: Single row from market DataFrame with market metrics
+        
+    Returns:
+        True if market meets criteria, False otherwise
+    """
+    try:
+        # Extract metrics with safe defaults
+        liquidity = float(market_row.get("liquidity", 0))
+        volume_7d = float(market_row.get("avg_volume_1wk", 0)) * 7  # Convert daily average to weekly
+        best_bid = float(market_row.get("best_bid", 0))
+        
+        # Market size criteria (same as in build_market_size_df)
+        mm_score = liquidity * (volume_7d ** 0.5) if volume_7d > 0 else 0
+        
+        # Criteria thresholds
+        min_liquidity = 1000000.0  # $1M minimum liquidity
+        min_weekly_volume = 50000.0  # $50K minimum weekly volume
+        min_mm_score = 1000000.0  # Minimum market making score
+        min_bid = 0.15  # Minimum bid price
+        max_bid = 0.85  # Maximum bid price
+        
+        # Check all criteria
+        meets_criteria = (
+            liquidity >= min_liquidity and  # noqa: W504
+            volume_7d >= min_weekly_volume and  # noqa: W504
+            mm_score >= min_mm_score and  # noqa: W504
+            min_bid <= best_bid <= max_bid
+        )
+        
+        if not meets_criteria:
+            logger.info(f"Market '{market_row.get('market', 'Unknown')}' fails criteria: "
+                       f"liquidity=${liquidity:,.0f} (min: ${min_liquidity:,.0f}), "
+                       f"volume_7d=${volume_7d:,.0f} (min: ${min_weekly_volume:,.0f}), "
+                       f"mm_score={mm_score:,.0f} (min: {min_mm_score:,.0f}), "
+                       f"best_bid={best_bid:.3f} (range: {min_bid:.3f}-{max_bid:.3f})")
+        
+        return meets_criteria
+        
+    except Exception as e:
+        logger.warning(f"Error checking market size criteria: {e}")
+        return False  # Fail safe - remove if we can't verify
+
+
+def protect_currently_traded_markets(filtered_df: pd.DataFrame, selected_markets_df: pd.DataFrame, 
+                                   ms_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Protect markets that are currently in Selected Markets from being removed by AI filtering.
+    This prevents disruption to active trading positions.
+    
+    EXCEPTION: Markets that no longer meet market size criteria are removed even if currently traded.
+    
+    Args:
+        filtered_df: DataFrame of markets that passed AI filtering
+        selected_markets_df: DataFrame of currently selected markets being traded
+        ms_df: Original market size DataFrame with full market data
+        
+    Returns:
+        DataFrame with currently traded markets protected from AI removal (except those failing criteria)
+    """
+    if selected_markets_df.empty:
+        logger.info("No currently selected markets to protect")
+        return filtered_df
+    
+    # Get currently traded market questions
+    current_questions = set()
+    if "question" in selected_markets_df.columns:
+        current_questions = set(selected_markets_df["question"].astype(str).tolist())
+    elif "market" in selected_markets_df.columns:
+        current_questions = set(selected_markets_df["market"].astype(str).tolist())
+    
+    if not current_questions:
+        logger.info("No currently traded market questions found")
+        return filtered_df
+    
+    logger.info(f"Found {len(current_questions)} currently traded markets to evaluate")
+    
+    # Find markets that were filtered out by AI but are currently traded
+    filtered_questions = set(filtered_df["question"].tolist())
+    protected_markets = []
+    removed_criteria_failures = []
+    
+    for question in current_questions:
+        if question not in filtered_questions:
+            # This market was filtered out by AI but is currently traded
+            # Find it in the original market size data
+            original_row = ms_df[ms_df["market"] == question]
+            if not original_row.empty:
+                market_data = original_row.iloc[0]
+                
+                # Check if market still meets size criteria
+                if check_market_size_criteria(market_data):
+                    # Market meets criteria - protect it from AI removal
+                    protected_row = market_data.copy()
+                    # Ensure the row has the expected column names for the filtered output
+                    if "question" not in protected_row:
+                        protected_row["question"] = protected_row.get("market", question)
+                    protected_markets.append(protected_row)
+                    logger.warning(f"🛡️  Protecting currently traded market from AI removal: {question}")
+                else:
+                    # Market no longer meets criteria - allow removal
+                    removed_criteria_failures.append(question)
+                    logger.warning(f"⚠️  Allowing removal of currently traded market (fails criteria): {question}")
+            else:
+                logger.warning(f"⚠️  Currently traded market '{question}' not found in market size data")
+    
+    # Log summary of protection decisions
+    if protected_markets:
+        logger.info(f"✅ Protecting {len(protected_markets)} currently traded markets that meet criteria")
+    
+    if removed_criteria_failures:
+        logger.warning(f"🗑️  Allowing removal of {len(removed_criteria_failures)} currently traded markets that fail criteria:")
+        for market in removed_criteria_failures[:5]:  # Show first 5
+            logger.warning(f"  - {market}")
+        if len(removed_criteria_failures) > 5:
+            logger.warning(f"  ... and {len(removed_criteria_failures) - 5} more")
+    
+    if protected_markets:
+        # Add protected markets back to filtered DataFrame
+        protected_df = pd.DataFrame(protected_markets)
+        
+        # Ensure protected markets have all required columns including condition_id
+        required_cols = ["question", "token1", "token2", "condition_id", "rules"]
+        for col in required_cols:
+            if col not in protected_df.columns:
+                if col == "rules" and "description" in protected_df.columns:
+                    protected_df[col] = protected_df["description"]
+                elif col == "condition_id" and "condition_id" in protected_df.columns:
+                    protected_df[col] = protected_df["condition_id"]
+                else:
+                    protected_df[col] = ""
+        
+        # Clean token strings in protected markets
+        protected_df["token1"] = protected_df["token1"].apply(clean_token_string)
+        protected_df["token2"] = protected_df["token2"].apply(clean_token_string)
+        protected_df["token1"] = protected_df["token1"].astype(str)
+        protected_df["token2"] = protected_df["token2"].astype(str)
+        
+        # Merge with filtered results
+        final_df = pd.concat([filtered_df, protected_df], ignore_index=True)
+        logger.info(f"Final filtered markets: {len(final_df)} (AI filtered: {len(filtered_df)}, Protected: {len(protected_markets)}, Removed by criteria: {len(removed_criteria_failures)})")
+        
+        return final_df
+    else:
+        logger.info("✅ No currently traded markets need protection (all either passed AI filtering or failed criteria)")
+        return filtered_df
+
+
+def get_ai_evaluation_data(original_df: pd.DataFrame, filtered_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Create a DataFrame showing the raw AI evaluation results for all markets.
+    
+    Args:
+        original_df: Original DataFrame with all markets before AI filtering
+        filtered_df: DataFrame with markets that passed AI filtering
+        
+    Returns:
+        DataFrame with columns: question, token1, token2, ai_decision, ai_reason, passed_filtering
+    """
+    try:
+        # Get all original questions
+        filtered_questions = set(filtered_df["question"].astype(str).tolist())
+        
+        # Create evaluation DataFrame
+        evaluation_data = []
+        
+        for _, row in original_df.iterrows():
+            question = str(row.get("question", ""))
+            token1 = str(row.get("token1", ""))
+            token2 = str(row.get("token2", ""))
+            
+            # Determine AI decision based on filtering result
+            if question in filtered_questions:
+                ai_decision = "ELIGIBLE"
+                ai_reason = "Passed AI filtering criteria"
+                passed_filtering = True
+            else:
+                ai_decision = "AVOID"
+                ai_reason = "Marked as AVOID by AI (insider-prone, ambiguous, manipulable, etc.)"
+                passed_filtering = False
+            
+            evaluation_data.append({
+                "question": question,
+                "token1": token1,
+                "token2": token2,
+                "ai_decision": ai_decision,
+                "ai_reason": ai_reason,
+                "passed_filtering": passed_filtering
+            })
+        
+        # Create DataFrame and sort by decision (ELIGIBLE first, then AVOID)
+        evaluation_df = pd.DataFrame(evaluation_data)
+        evaluation_df = evaluation_df.sort_values(["passed_filtering", "question"], ascending=[False, True]).reset_index(drop=True)
+        
+        logger.info(f"Created AI evaluation data for {len(evaluation_df)} markets")
+        logger.info(f"AI decisions: {len(evaluation_df[evaluation_df['ai_decision'] == 'ELIGIBLE'])} ELIGIBLE, {len(evaluation_df[evaluation_df['ai_decision'] == 'AVOID'])} AVOID")
+        
+        return evaluation_df
+        
+    except Exception as e:
+        logger.error(f"Error creating AI evaluation data: {e}")
+        # Return empty DataFrame with correct schema
+        return pd.DataFrame(columns=["question", "token1", "token2", "ai_decision", "ai_reason", "passed_filtering"])
+
+
+def log_filtering_changes(original_df: pd.DataFrame, filtered_df: pd.DataFrame, 
+                         selected_markets_df: pd.DataFrame) -> dict:
+    """
+    Log all changes made by AI filtering for transparency.
+    
+    Returns:
+        Dictionary with summary of filtering changes
+    """
+    original_questions = set(original_df["question"].tolist())
+    filtered_questions = set(filtered_df["question"].tolist())
+    
+    # Get currently traded markets
+    current_questions = set()
+    if "question" in selected_markets_df.columns:
+        current_questions = set(selected_markets_df["question"].astype(str).tolist())
+    elif "market" in selected_markets_df.columns:
+        current_questions = set(selected_markets_df["market"].astype(str).tolist())
+    
+    # What was removed
+    removed = original_questions - filtered_questions
+    removed_current = removed & current_questions
+    removed_new = removed - current_questions
+    
+    # What was kept
+    kept = filtered_questions
+    kept_current = kept & current_questions
+    kept_new = kept - current_questions
+    
+    logger.info("=== AI Filtering Summary ===")
+    logger.info(f"Total markets: {len(original_questions)}")
+    logger.info(f"Markets kept: {len(kept)} ({len(kept_current)} current, {len(kept_new)} new)")
+    logger.info(f"Markets removed: {len(removed)} ({len(removed_current)} current, {len(removed_new)} new)")
+    
+    if removed_current:
+        logger.warning("⚠️  AI wants to remove currently traded markets:")
+        for market in list(removed_current)[:10]:  # Show first 10
+            logger.warning(f"  - {market}")
+        if len(removed_current) > 10:
+            logger.warning(f"  ... and {len(removed_current) - 10} more")
+    
+    return {
+        "removed_current": removed_current,
+        "removed_new": removed_new,
+        "kept_current": kept_current,
+        "kept_new": kept_new
+    }
 
 
 def _chunk(items: List[str], size: int) -> Iterable[List[str]]:
@@ -196,15 +489,15 @@ def build_market_size_df(
             try:
                 if isinstance(v, list):
                     if len(v) > 0:
-                        t1 = str(v[0])
+                        t1 = clean_token_string(str(v[0]))
                     if len(v) > 1:
-                        t2 = str(v[1])
+                        t2 = clean_token_string(str(v[1]))
                 elif isinstance(v, str):
                     parts = [p.strip() for p in v.split(",") if p.strip()]
                     if len(parts) > 0:
-                        t1 = parts[0]
+                        t1 = clean_token_string(parts[0])
                     if len(parts) > 1:
-                        t2 = parts[1]
+                        t2 = clean_token_string(parts[1])
             except Exception:
                 t1, t2 = "", ""
             token1_list.append(t1)
@@ -222,6 +515,10 @@ def build_market_size_df(
     out["description"] = description_series
     out["token1"] = pd.Series(token1_list, index=out.index)
     out["token2"] = pd.Series(token2_list, index=out.index)
+    
+    # Ensure token columns are explicitly strings to prevent scientific notation
+    out["token1"] = out["token1"].astype(str)
+    out["token2"] = out["token2"].astype(str)
     # Weekly/monthly totals with fallbacks from 24h volume to avoid zeroed scores
     weekly_total = wk_series.copy()
     monthly_total = mo_series.copy()
@@ -313,7 +610,26 @@ def main() -> None:
                     "token2": ms_df.get("token2", pd.Series([""] * len(ms_df))).astype(str),
                     "rules": ms_df.get("description", pd.Series([""] * len(ms_df))).astype(str),
                 })
+                # Read currently selected markets to protect them from AI removal
+                try:
+                    selected_markets_df = read_sheet(spreadsheet, "Selected Markets")
+                    logger.info(f"Found {len(selected_markets_df)} currently selected markets to protect")
+                except Exception:
+                    logger.warning("Could not read Selected Markets sheet; no protection will be applied")
+                    selected_markets_df = pd.DataFrame()
+                
+                # Run AI filtering and capture raw evaluation results
                 filtered = remove_markets_to_avoid(pairs_df=pairs_df)
+                
+                # Get raw AI evaluation data for transparency
+                ai_evaluation_df = get_ai_evaluation_data(pairs_df, filtered)
+                
+                # Apply Grandfather Clause: protect currently traded markets from AI removal
+                if not selected_markets_df.empty:
+                    filtered = protect_currently_traded_markets(filtered, selected_markets_df, ms_df)
+                    
+                    # Log filtering changes for transparency
+                    log_filtering_changes(pairs_df, filtered, selected_markets_df)
                 # Merge back extra Market Size fields for the kept questions
                 if not filtered.empty:
                     # Only merge back data for the questions that passed the AI filter
@@ -328,22 +644,78 @@ def main() -> None:
                         how="left",
                         suffixes=("", "_ms"),
                     )
-                    # Keep a tidy set of columns
-                    cols = [
-                        "question", "token1", "token2", "rules",
-                        "condition_id", "liquidity", "volume24hr", "avg_volume_1wk", "avg_volume_1mo",
+                    
+                    # Ensure essential columns are always first in the correct order
+                    essential_cols = ["question", "token1", "token2", "condition_id"]
+                    
+                    # Additional columns in preferred order
+                    additional_cols = [
+                        "rules", "liquidity", "volume24hr", "avg_volume_1wk", "avg_volume_1mo",
                         "trend_score", "mm_score", "best_bid", "best_ask", "description",
                     ]
-                    present = [c for c in cols if c in merged.columns]
-                    out_df = merged[present].copy()
+                    
+                    # Build final column order: essential first, then additional if present
+                    final_cols = []
+                    
+                    # Add essential columns first (in order)
+                    for col in essential_cols:
+                        if col in merged.columns:
+                            final_cols.append(col)
+                        else:
+                            logger.warning(f"Essential column '{col}' missing from merged data")
+                    
+                    # Add additional columns if present
+                    for col in additional_cols:
+                        if col in merged.columns:
+                            final_cols.append(col)
+                    
+                    # Create output DataFrame with guaranteed column order
+                    out_df = merged[final_cols].copy()
+                    
+                    # Clean token strings in the final output before writing to sheet
+                    out_df["token1"] = out_df["token1"].apply(clean_token_string)
+                    out_df["token2"] = out_df["token2"].apply(clean_token_string)
+                    
+                    # Ensure token columns are explicitly strings to prevent scientific notation
+                    out_df["token1"] = out_df["token1"].astype(str)
+                    out_df["token2"] = out_df["token2"].astype(str)
+                    
+                    # Sort by mm_score in descending order (best markets first)
+                    if "mm_score" in out_df.columns:
+                        # Handle any NaN values in mm_score before sorting
+                        if out_df["mm_score"].isna().any():
+                            logger.warning(f"Found {out_df['mm_score'].isna().sum()} markets with NaN mm_score - filling with 0")
+                            out_df["mm_score"] = out_df["mm_score"].fillna(0)
+                        
+                        # Sort by mm_score in descending order
+                        out_df = out_df.sort_values("mm_score", ascending=False).reset_index(drop=True)
+                        
+                        # Log sorting results
+                        max_score = out_df["mm_score"].max()
+                        min_score = out_df["mm_score"].min()
+                        logger.info(f"✅ Sorted {len(out_df)} markets by mm_score (highest: {max_score:,.0f}, lowest: {min_score:,.0f})")
+                        
+                        # Show top 3 markets for verification
+                        if len(out_df) > 0:
+                            top_markets = out_df.head(3)
+                            logger.info("🏆 Top 3 markets by mm_score:")
+                            for i, (_, row) in enumerate(top_markets.iterrows(), 1):
+                                logger.info(f"  {i}. {row.get('question', 'Unknown')[:50]}... (score: {row['mm_score']:,.0f})")
+                    else:
+                        logger.warning("⚠️  mm_score column not found - cannot sort by market making score")
                 else:
+                    # Create empty DataFrame with consistent column ordering
                     out_df = pd.DataFrame(columns=[
-                        "question", "token1", "token2", "rules",
-                        "condition_id", "liquidity", "volume24hr", "avg_volume_1wk", "avg_volume_1mo",
+                        "question", "token1", "token2", "condition_id",
+                        "rules", "liquidity", "volume24hr", "avg_volume_1wk", "avg_volume_1mo",
                         "trend_score", "mm_score", "best_bid", "best_ask", "description",
                     ])
                 write_sheet(spreadsheet, "Filtered Markets", out_df)
                 logger.info("Wrote %d rows to sheet 'Filtered Markets'", len(out_df))
+                
+                # Write AI Evaluation sheet for transparency
+                write_sheet(spreadsheet, "AI Evaluation", ai_evaluation_df)
+                logger.info("Wrote %d rows to sheet 'AI Evaluation'", len(ai_evaluation_df))
     except Exception:
         logger.exception("Failed to write 'Market Size' sheet")
 

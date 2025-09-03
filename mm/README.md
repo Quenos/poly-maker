@@ -237,15 +237,258 @@ Markets REMOVED: ['old_token']
 
 ### CLI Tools (`mm/cli.py`)
 
+The market making daemon includes several command-line utilities for data analysis and maintenance operations.
+
 #### Export PnL
 ```bash
 python -m mm.cli export_pnl --date 2025-09-03
 ```
+**What it does**: Exports daily PnL data from the SQLite database to CSV format. This tool aggregates realized and unrealized PnL, fees, and rebates for a specific date, providing detailed performance analysis for reporting and analysis purposes.
+
+**Output**: CSV file with columns for date, realized PnL, unrealized PnL, fees, and rebates.
 
 #### Rebuild Positions
 ```bash
 python -m mm.cli rebuild_positions
 ```
+**What it does**: Reconstructs the current position state by analyzing the complete fill history in the database. This is useful when the position tracking gets out of sync or when you need to verify the current state against historical data.
+
+**Output**: Updates the positions table in the database and logs the reconstructed position counts.
+
+### Market Sheet Creation Tools
+
+The market making system relies on Google Sheets to define which markets to trade. Several tools help create and maintain these sheets with filtered and ranked markets.
+
+#### 1. Market Size Sheet Creation (`update_market_size.py`)
+
+This tool fetches market data from the Gamma API and creates two essential sheets with intelligent market protection:
+
+**Market Size Sheet**: Contains comprehensive market data including:
+- Market questions and descriptions
+- Token IDs (token1, token2, condition_id)
+- Liquidity metrics and volume data
+- Trend scores and market making scores
+- Best bid/ask prices
+
+**Filtered Markets Sheet**: Uses AI-powered filtering with **Grandfather Clause Protection**:
+- Applies liquidity and volume thresholds
+- Uses OpenAI to evaluate market suitability
+- Removes markets labeled as "AVOID" by AI analysis
+- **🛡️ Protects currently traded markets** that still meet criteria
+- **🗑️ Removes currently traded markets** that no longer meet criteria
+- Preserves only markets suitable for market making
+
+**🛡️ Grandfather Clause Protection**:
+The tool automatically protects markets currently in "Selected Markets" from being removed by AI filtering, **EXCEPT** when they no longer meet the minimum market size criteria:
+
+**Protection Criteria** (markets must meet ALL):
+- **Liquidity**: Minimum $1,000,000
+- **Weekly Volume**: Minimum $50,000  
+- **Market Making Score**: Minimum 1,000,000 (liquidity × √weekly_volume)
+- **Bid Price Range**: Between 0.15 and 0.85
+
+**Protection Logic**:
+```
+Currently Traded Market Filtered Out by AI?
+├─ Yes → Check if still meets market size criteria
+│   ├─ Meets criteria → 🛡️ PROTECT (add back to filtered results)
+│   └─ Fails criteria → 🗑️ ALLOW REMOVAL (don't protect)
+└─ No → Already passed AI filtering (no action needed)
+```
+
+**Usage**:
+```bash
+# Create both Market Size and Filtered Markets sheets with protection
+python update_market_size.py
+
+# Create only Market Size sheet (no AI filtering, no protection needed)
+python update_market_size.py --all
+```
+
+**What it does**:
+1. Fetches all markets from Gamma API
+2. Calculates liquidity, volume, and trend metrics
+3. Applies configurable filtering criteria
+4. Uses AI to evaluate market suitability
+5. **Applies Grandfather Clause protection** for currently traded markets
+6. **Removes markets that fail criteria** even if currently traded
+7. Writes results to Google Sheets with comprehensive logging
+
+**Benefits**:
+- **Zero Disruption**: Quality markets are never disrupted by AI filtering
+- **Quality Control**: Poor markets are automatically removed
+- **Transparency**: Complete visibility into protection decisions
+- **Automatic**: No manual intervention required
+- **Consistent**: Uses same criteria as original market filtering
+
+#### 2. Market Filtering (`ai/filter_markets.py`)
+
+Advanced AI-powered tool that evaluates markets for trading suitability:
+
+**Features**:
+- **AI Evaluation**: Uses OpenAI GPT models to analyze market questions
+- **Content Filtering**: Removes markets with inappropriate content
+- **Risk Assessment**: Identifies markets that may be unsuitable for trading
+- **Batch Processing**: Handles large numbers of markets efficiently
+- **Configurable Models**: Supports different OpenAI models for filtering
+
+**Usage**:
+```bash
+python ai/filter_markets.py --stage filter --model gpt-4o-mini
+```
+
+**What it does**:
+1. Fetches all available markets from Polymarket
+2. Sends market questions to OpenAI for evaluation
+3. Uses structured prompts to classify markets as ELIGIBLE or AVOID
+4. Returns filtered DataFrame with only suitable markets
+5. Supports parallel processing for large datasets
+
+#### 3. Market Data Updates (`update_markets.py`)
+
+Comprehensive tool for updating market data and calculating trading metrics:
+
+**Features**:
+- **Real-time Data**: Fetches current order book and market data
+- **Volatility Calculation**: Computes short and long-term volatility metrics
+- **Reward Analysis**: Calculates maker rewards and trading opportunities
+- **Composite Scoring**: Ranks markets by multiple factors
+- **Sheet Synchronization**: Updates multiple Google Sheets automatically
+
+**Usage**:
+```bash
+python update_markets.py
+```
+
+**What it does**:
+1. Fetches current market data from Polymarket CLOB
+2. Calculates volatility across multiple timeframes
+3. Computes maker rewards and trading scores
+4. Sorts markets by composite scoring
+5. Updates All Markets, Volatility Markets, and Full Markets sheets
+
+#### 4. Selected Markets Management (`store_selected_markets.py`)
+
+Tool for managing the final "Selected Markets" sheet that the daemon actually trades:
+
+**Features**:
+- **Sheet Synchronization**: Syncs selected markets across multiple sheets
+- **Data Validation**: Ensures token IDs and condition IDs are properly formatted
+- **Column Preservation**: Maintains consistent data structure across sheets
+
+**Usage**:
+```bash
+python store_selected_markets.py
+```
+
+**What it does**:
+1. Reads the "Selected Markets" sheet
+2. Finds corresponding data in "All Markets" sheet
+3. Creates "Stored Sel Markets" with complete market information
+4. Ensures all required columns are present and properly formatted
+
+### Creating Your Market Selection Workflow
+
+To set up a complete market selection system:
+
+#### Step 1: Initial Setup
+```bash
+# 1. Create Market Size sheet with all available markets
+python update_market_size.py --all
+
+# 2. Review the Market Size sheet and identify potential markets
+# Look for markets with good liquidity, volume, and clear questions
+```
+
+#### Step 2: AI Filtering
+```bash
+# 3. Apply AI filtering to remove unsuitable markets
+python update_market_size.py
+# This creates the Filtered Markets sheet with AI-approved markets
+```
+
+#### Step 3: Manual Selection
+```bash
+# 4. Manually review Filtered Markets and copy desired markets to Selected Markets
+# Use Google Sheets to copy rows from "Filtered Markets" to "Selected Markets"
+# Ensure columns: question, token1, token2, condition_id are present
+```
+
+#### Step 4: Daemon Integration
+```bash
+# 5. The market making daemon will automatically read from "Selected Markets"
+# It monitors this sheet every 15 minutes for changes
+```
+
+#### Step 5: Ongoing Maintenance
+```bash
+# 6. Regularly update market data and re-run filtering
+python update_markets.py          # Update market metrics
+python update_market_size.py      # Refresh AI filtering
+```
+
+### Sheet Structure Requirements
+
+#### Selected Markets Sheet (Required)
+The daemon reads from this sheet and requires these columns:
+- **token1**: First token ID (required)
+- **token2**: Second token ID (required)  
+- **condition_id**: Market condition ID (recommended)
+- **question/market**: Market question text (optional, for reference)
+
+#### Market Size Sheet (Generated)
+Contains comprehensive market data for analysis:
+- Market metadata and descriptions
+- Liquidity and volume metrics
+- Trend scores and market making scores
+- Current bid/ask prices
+
+#### Filtered Markets Sheet (Generated)
+AI-filtered subset of markets:
+- Only markets passing AI suitability checks
+- Preserves all Market Size columns
+- Ready for manual review and selection
+
+### Configuration for Market Tools
+
+#### Environment Variables
+```bash
+# Required for Google Sheets access
+SPREADSHEET_URL=https://docs.google.com/spreadsheets/d/your-sheet-id
+
+# Required for AI filtering
+OPENAI_API_KEY=your-openai-api-key
+
+# Required for market data access
+POLYGON_RPC_URL=https://polygon-rpc.com
+```
+
+#### Google Sheets Setup
+1. Create a Google Sheet with the URL from `SPREADSHEET_URL`
+2. Ensure the service account has edit access
+3. The tools will automatically create required worksheets
+4. Recommended sheet names: "Market Size", "Filtered Markets", "Selected Markets"
+
+### Best Practices
+
+#### Market Selection Criteria
+- **Liquidity**: Minimum $10,000+ for reliable pricing
+- **Volume**: Weekly volume > $50,000 for active trading
+- **Question Quality**: Clear, unambiguous questions
+- **Content**: Appropriate content that passes AI filtering
+- **Token Availability**: Both YES/NO tokens must be available
+
+#### Maintenance Schedule
+- **Daily**: Run `update_markets.py` for current data
+- **Weekly**: Run `update_market_size.py` for AI re-filtering
+- **As Needed**: Manually review and update Selected Markets
+- **Monitoring**: Check daemon logs for market selection changes
+
+#### Troubleshooting
+- **Missing Markets**: Ensure condition_id columns are populated
+- **AI Filtering Failures**: Check OpenAI API key and rate limits
+- **Sheet Sync Issues**: Verify Google Sheets permissions
+- **Data Quality**: Ensure token IDs are properly formatted as strings
 
 ### Persistence & Metrics
 
