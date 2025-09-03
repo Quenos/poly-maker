@@ -14,23 +14,7 @@
         <a id="total-pnl" class="pill" href="pnl" title="View per-trade PnL">PnL: —</a>
       </div>
 
-      <section>
-        <h2>Open Orders</h2>
-        <table id="orders">
-          <thead>
-            <tr>
-              <th>Market</th>
-              <th>Outcome</th>
-              <th>Side</th>
-              <th>Price</th>
-              <th>Orig Size</th>
-              <th>Matched</th>
-              <th>Status</th>
-            </tr>
-          </thead>
-          <tbody></tbody>
-        </table>
-      </section>
+      
 
       <section>
         <h2>Positions</h2>
@@ -141,16 +125,16 @@
 
       async function refresh() {
         try {
-          const [orders, positions, trades, pnl] = await Promise.all([
-            fetchJson('api/orders'),
+          const [posRes, trRes, pnlRes] = await Promise.allSettled([
             fetchJson('api/positions'),
             fetchJson(`api/trades?limit=${tradesPerPage}&page=${tradePage}`),
             fetchJson('api/pnl'),
           ]);
 
-          setRows(document.querySelector('#orders tbody'), orders.data || [], [
-            'market_name', 'outcome', 'side', 'price', 'original_size', 'size_matched', 'status'
-          ]);
+          const positions = posRes.status === 'fulfilled' ? posRes.value : { data: [] };
+          const trades = trRes.status === 'fulfilled' ? trRes.value : { data: [], total: 0 };
+          const pnl = pnlRes.status === 'fulfilled' ? pnlRes.value : { total: 0 };
+
           setRows(
             document.querySelector('#positions tbody'),
             positions.data || [],
