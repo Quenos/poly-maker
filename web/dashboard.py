@@ -21,7 +21,6 @@ except Exception as exc:
 try:
     from poly_data import global_state  # type: ignore
     from poly_data.polymarket_client import PolymarketClient  # type: ignore
-    from poly_data.utils import get_sheet_df  # type: ignore
 except Exception as exc:
     raise RuntimeError("poly_data package not found in workspace") from exc
 
@@ -53,18 +52,6 @@ def _ensure_client() -> PolymarketClient:
         logger.info("Initializing PolymarketClient for dashboard")
         global_state.client = PolymarketClient(initialize_api=True)
     return global_state.client  # type: ignore[return-value]
-
-
-def _ensure_sheet_loaded() -> None:
-    try:
-        df = getattr(global_state, "df", None)
-        if df is None or getattr(df, "empty", True):
-            logger.info("Loading market config from Google Sheet (read-only)")
-            sheet_df, sheet_params = get_sheet_df(read_only=True)
-            global_state.df = sheet_df
-            global_state.params = sheet_params
-    except Exception as exc:
-        logger.info("Sheet metadata unavailable: %s", str(exc))
 
 
 def _df_to_records(df: pd.DataFrame, fields: Optional[List[str]] = None) -> List[Dict[str, Any]]:
@@ -153,89 +140,7 @@ if not os.path.isdir(STATIC_DIR):
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
-def _build_metadata_maps() -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
-    """
-    Build maps for enriching rows with market name and outcome using the Selected Markets sheet.
-
-    Returns:
-        token_to_market_name, token_to_outcome, market_to_name
-    """
-    token_to_market: Dict[str, str] = {}
-    token_to_outcome: Dict[str, str] = {}
-    market_to_name: Dict[str, str] = {}
-
-    try:
-        _ensure_sheet_loaded()
-        df = getattr(global_state, "df", None)
-        if df is not None and not df.empty:  # type: ignore[attr-defined]
-            logger.info(f"Building metadata maps from Selected Markets sheet with {len(df)} rows")
-            logger.info(f"Sheet columns: {list(df.columns)}")
-            
-            # Try different column name variations
-            question_col = None
-            condition_col = None
-            token1_col = None
-            token2_col = None
-            answer1_col = None
-            answer2_col = None
-            
-            for col in df.columns:
-                col_lower = col.lower()
-                if 'question' in col_lower or 'title' in col_lower:
-                    question_col = col
-                elif 'condition' in col_lower or 'market' in col_lower:
-                    condition_col = col
-                elif 'token1' in col_lower or 'asset1' in col_lower:
-                    token1_col = col
-                elif 'token2' in col_lower or 'asset2' in col_lower:
-                    token2_col = col
-                elif 'answer1' in col_lower or 'outcome1' in col_lower:
-                    answer1_col = col
-                elif 'answer2' in col_lower or 'outcome2' in col_lower:
-                    answer2_col = col
-            
-            logger.info(f"Detected columns: question='{question_col}', condition='{condition_col}', token1='{token1_col}', token2='{token2_col}', answer1='{answer1_col}', answer2='{answer2_col}'")
-            
-            # Build mappings
-            for _, r in df.iterrows():
-                q = str(r.get(question_col, "")) if question_col else ""
-                m = str(r.get(condition_col, "")) if condition_col else ""
-                t1 = str(r.get(token1_col, "")) if token1_col else ""
-                t2 = str(r.get(token2_col, "")) if token2_col else ""
-                a1 = str(r.get(answer1_col, "")) if answer1_col else ""
-                a2 = str(r.get(answer2_col, "")) if answer2_col else ""
-                
-                # Log the first row for debugging
-                if _ == 0:
-                    logger.info(f"First row data: question='{q}', condition='{m}', token1='{t1}', token2='{t2}', answer1='{a1}', answer2='{a2}'")
-                
-                if m and m != "nan":
-                    market_to_name[m] = q
-                if t1 and t1 != "nan":
-                    token_to_market[t1] = q
-                    token_to_outcome[t1] = a1
-                if t2 and t2 != "nan":
-                    token_to_market[t2] = q
-                    token_to_outcome[t2] = a2
-            
-            logger.info(f"Built maps from Selected Markets sheet: {len(token_to_market)} token->market, {len(token_to_outcome)} token->outcome, {len(market_to_name)} market->name")
-            
-            # Log some sample mappings for debugging
-            if token_to_market:
-                sample_tokens = list(token_to_market.items())[:3]
-                logger.info(f"Sample token->market mappings: {sample_tokens}")
-            if market_to_name:
-                sample_markets = list(market_to_name.items())[:3]
-                logger.info(f"Sample market->name mappings: {sample_markets}")
-                
-        else:
-            logger.warning("No Selected Markets sheet data available for building metadata maps")
-    except Exception as e:
-        logger.warning(f"Error building metadata maps from Selected Markets sheet: {e}")
-        # Keep empty maps if df unavailable
-        pass
-
-    return token_to_market, token_to_outcome, market_to_name
+# Removed Google Sheets-based metadata mapping. Resolution now relies on Gamma API exclusively.
 
 
 def _fetch_markets_metadata(
@@ -356,12 +261,10 @@ def _fetch_assets_metadata(
                 mid = item.get("conditionId") or item.get("marketId") or item.get("market_id")
                 
                 # Extract market name/question
-                name = (item.get("question") or item.get("title") or item.get("marketTitle") or 
-                       item.get("market_title") or item.get("name"))
+                name = (item.get("question") or item.get("title") or item.get("marketTitle") or item.get("market_title") or item.get("name"))
                 
                 # Extract outcome/answer
-                out = (item.get("outcome") or item.get("answer") or item.get("outcomeTitle") or 
-                      item.get("outcome_title") or item.get("title"))
+                out = (item.get("outcome") or item.get("answer") or item.get("outcomeTitle") or item.get("outcome_title") or item.get("title"))
                 
                 if mid:
                     token_to_market_id[tid_s] = str(mid)
@@ -656,25 +559,7 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
                         # For now, we'll rely on the Selected Markets sheet fallback
                 except Exception as e:
                     logger.warning(f"Markets API fallback failed: {e}")
-        # 4) Fallback to Selected Markets sheet mappings
-        t2m, t2o, m2n = _build_metadata_maps()
-        logger.info(f"Built fallback maps from Selected Markets sheet: {len(t2m)} token->market, {len(t2o)} token->outcome, {len(m2n)} market->name")
-        if asset_col:
-            mask = orders_df["market_name"].eq("") & orders_df[asset_col].notna()
-            if mask.any():
-                orders_df.loc[mask, "market_name"] = orders_df.loc[mask, asset_col].astype(str).map(t2m).fillna("")
-                filled_count = mask.sum()
-                logger.info(f"Filled {filled_count} missing market names from Selected Markets sheet")
-            mask_out = orders_df["outcome"].eq("") & orders_df[asset_col].notna()
-            if mask_out.any():
-                orders_df.loc[mask_out, "outcome"] = orders_df.loc[mask_out, asset_col].astype(str).map(t2o).fillna("")
-                filled_outcomes = mask_out.sum()
-                logger.info(f"Filled {filled_outcomes} missing outcomes from Selected Markets sheet")
-        if "market" in orders_df.columns:
-            mask = orders_df["market_name"].eq("") & orders_df["market"].notna()
-            if mask.any():
-                orders_df.loc[mask, "market_name"] = orders_df.loc[mask, "market"].astype(str).map(m2n).fillna("")
-                logger.info(f"Filled {mask.sum()} missing market names from market IDs")
+        # No Google Sheets fallback; rely on Gamma/data APIs only
         
         total_orders = len(orders_df)
         orders_with_names = orders_df["market_name"].notna().sum()
@@ -685,7 +570,7 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
         if asset_col and orders_with_names < total_orders:
             missing_tokens = orders_df.loc[orders_df["market_name"].eq(""), asset_col].astype(str).unique()
             logger.warning(f"Tokens still missing market names: {[t[:20] + '...' for t in missing_tokens]}")
-            logger.info("These tokens need to be added to your Selected Markets sheet for proper market name resolution")
+            logger.info("Some tokens still missing market names after API lookups")
         
         # Normalize fields commonly used
         wanted = [
@@ -709,7 +594,7 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
 
 @app.get("/api/orders/debug")
 def get_orders_debug(user=Depends(require_user)) -> Dict[str, Any]:
-    """Debug endpoint to see raw order data and metadata mapping process from Selected Markets sheet."""
+    """Debug endpoint to see raw order data and API-based metadata enrichment (Gamma/markets)."""
     client = _ensure_client()
     try:
         orders_df = client.get_all_orders()
@@ -756,12 +641,11 @@ def get_orders_debug(user=Depends(require_user)) -> Dict[str, Any]:
                     "outcomes": dict(list(to_f.items())[:3])
                 }
                 
-                # Test sheet mappings
-                t2m, t2o, m2n = _build_metadata_maps()
+                # No Google Sheets mappings (removed); include empty placeholders
                 debug_info["sheet_mappings"] = {
-                    "token_to_market": dict(list(t2m.items())[:3]),
-                    "token_to_outcome": dict(list(t2o.items())[:3]),
-                    "market_to_name": dict(list(m2n.items())[:3])
+                    "token_to_market": {},
+                    "token_to_outcome": {},
+                    "market_to_name": {}
                 }
             else:
                 debug_info["asset_column_used"] = "None found"
@@ -775,7 +659,7 @@ def get_orders_debug(user=Depends(require_user)) -> Dict[str, Any]:
 
 @app.get("/api/positions/debug")
 def get_positions_debug(user=Depends(require_user)) -> Dict[str, Any]:
-    """Debug endpoint to see raw position data and metadata mapping process from Selected Markets sheet."""
+    """Debug endpoint to see raw position data and API-based metadata enrichment (Gamma/markets)."""
     client = _ensure_client()
     try:
         pos_df = client.get_all_positions()
@@ -817,12 +701,11 @@ def get_positions_debug(user=Depends(require_user)) -> Dict[str, Any]:
                     "outcomes": dict(list(to_f.items())[:3])
                 }
                 
-                # Test sheet mappings
-                t2m, t2o, m2n = _build_metadata_maps()
+                # No Google Sheets mappings (removed); include empty placeholders
                 debug_info["sheet_mappings"] = {
-                    "token_to_market": dict(list(t2m.items())[:3]),
-                    "token_to_outcome": dict(list(t2o.items())[:3]),
-                    "market_to_name": dict(list(m2n.items())[:3])
+                    "token_to_market": {},
+                    "token_to_outcome": {},
+                    "market_to_name": {}
                 }
             else:
                 debug_info["asset_column_used"] = "None found"
@@ -920,36 +803,14 @@ def get_positions(user=Depends(require_user)) -> Dict[str, Any]:
                         mask = pos_df["outcome"].eq("") & pos_df[asset_col].notna()
                         pos_df.loc[mask, "outcome"] = pos_df.loc[mask, asset_col].astype(str).map(t2o_f).fillna("")
                         logger.info(f"Updated {len(t2o_f)} outcomes from markets API")
-
-            # 4) Fallback to Selected Markets sheet mappings
-            t2m, t2o, m2n = _build_metadata_maps()
-            logger.info(f"Built fallback maps from Selected Markets sheet: {len(t2m)} token->market, {len(t2o)} token->outcome, {len(m2n)} market->name")
             
-            if asset_col:
-                # Fill in missing market names
-                mask = pos_df["market_name"].eq("") & pos_df[asset_col].notna()
-                if mask.any():
-                    pos_df.loc[mask, "market_name"] = pos_df.loc[mask, asset_col].astype(str).map(t2m).fillna("")
-                    logger.info(f"Filled {mask.sum()} missing market names from Selected Markets sheet")
-                
-                # Fill in missing outcomes
-                mask_out = pos_df["outcome"].eq("") & pos_df[asset_col].notna()
-                if mask_out.any():
-                    pos_df.loc[mask_out, "outcome"] = pos_df.loc[mask_out, asset_col].astype(str).map(t2o).fillna("")
-                    logger.info(f"Filled {mask_out.sum()} missing outcomes from Selected Markets sheet")
+            # No Google Sheets fallback; rely on Gamma/data APIs only
             
             if "market" in pos_df.columns:
-                # Fill in missing market names using market IDs
+                # Fill in missing market names using market IDs (if previously fetched via markets API)
                 mask = pos_df["market_name"].eq("") & pos_df["market"].notna()
                 if mask.any():
-                    pos_df.loc[mask, "market_name"] = pos_df.loc[mask, "market"].astype(str).map(m2n).fillna("")
-                    logger.info(f"Filled {mask.sum()} missing market names from market IDs")
-            
-            # Final logging of results
-            total_positions = len(pos_df)
-            positions_with_names = pos_df["market_name"].notna().sum()
-            positions_with_outcomes = pos_df["outcome"].notna().sum()
-            logger.info(f"Final enrichment results: {positions_with_names}/{total_positions} positions have market names, {positions_with_outcomes}/{total_positions} have outcomes")
+                    logger.debug("Some market names still missing after API enrichment")
         
         wanted = ["market_name", "outcome", "size", "avgPrice", "curPrice", "percentPnl"]
         result = {"data": _df_to_records(pos_df, wanted)}
@@ -968,7 +829,7 @@ def get_recent_trades(limit: int = 10, page: int = 1, user=Depends(require_user)
     try:
         activity_df = fetch_activity_trades(wallet, per_page_limit=max(10, limit))
         if activity_df is None or activity_df.empty:
-            return {"data": []}
+            return {"data": [], "page": 1, "limit": limit, "total": 0}
         # sort newest first
         ts_col = None
         for c in ("timestamp", "ts", "created_at", "createdAt"):
@@ -982,8 +843,6 @@ def get_recent_trades(limit: int = 10, page: int = 1, user=Depends(require_user)
                 activity_df["datetime"] = pd.to_datetime(activity_df[ts_col], unit="s", errors="coerce").dt.strftime("%Y-%m-%d %H:%M:%S")
             except Exception:
                 activity_df["datetime"] = ""
-        # Enrich with market name and outcome if available from Selected Markets sheet
-        t2m, t2o, _ = _build_metadata_maps()
         # Prefer 'title'/'outcome' from activity if present
         if "title" in activity_df.columns:
             activity_df["market_name"] = activity_df["title"].astype(str)
@@ -994,7 +853,10 @@ def get_recent_trades(limit: int = 10, page: int = 1, user=Depends(require_user)
                     token_col = c
                     break
             if token_col is not None:
-                activity_df["market_name"] = activity_df[token_col].astype(str).map(t2m).fillna("")
+                # Resolve market names via Gamma API using tokens present on this page
+                token_ids = list(sorted(set(activity_df[token_col].dropna().astype(str))))[:20]
+                tm_f, _, _ = _fetch_assets_metadata(token_ids)
+                activity_df["market_name"] = activity_df[token_col].astype(str).map(tm_f).fillna("")
         if "outcome" not in activity_df.columns or activity_df["outcome"].isna().all():
             token_col = None
             for c in ("asset", "token_id", "tokenId", "asset_id"):
@@ -1002,7 +864,9 @@ def get_recent_trades(limit: int = 10, page: int = 1, user=Depends(require_user)
                     token_col = c
                     break
             if token_col is not None:
-                activity_df["outcome"] = activity_df[token_col].astype(str).map(t2o).fillna("")
+                token_ids = list(sorted(set(activity_df[token_col].dropna().astype(str))))[:20]
+                _, t2o_page, _ = _fetch_assets_metadata(token_ids)
+                activity_df["outcome"] = activity_df[token_col].astype(str).map(t2o_page).fillna("")
         # As last resort, try fetch by market if available
         if activity_df.get("market_name") is not None and activity_df["market_name"].eq("").any():
             mid_col = None
