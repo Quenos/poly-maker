@@ -487,9 +487,9 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
             logger.info(f"Set {orders_df['title'].notna().sum()} market names from title column")
         
         # 1) Assets API by token IDs - this is the secondary method
-        # Look for asset column with different possible names
+        # Look for asset column with different possible names (match positions order)
         asset_col = None
-        for col in ["asset_id", "asset", "token_id", "tokenId"]:
+        for col in ["asset", "token_id", "tokenId", "asset_id"]:
             if col in orders_df.columns:
                 asset_col = col
                 break
@@ -544,21 +544,7 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
                     orders_df.loc[mask, "outcome"] = orders_df.loc[mask, asset_col].astype(str).map(t2o_f).fillna("")
                     logger.info(f"Updated {len(t2o_f)} outcomes from markets API")
         
-        # 4) Enhanced fallback: Try markets API for any tokens that Gamma API failed to resolve
-        if asset_col and orders_df["market_name"].eq("").any():
-            # Get tokens that still don't have market names
-            missing_tokens = orders_df.loc[orders_df["market_name"].eq("") & orders_df[asset_col].notna(), asset_col].astype(str).unique()
-            if len(missing_tokens) > 0:
-                logger.info(f"Gamma API failed for {len(missing_tokens)} tokens, trying markets API as fallback")
-                # Try to get market IDs for these tokens from the markets API
-                try:
-                    # Use a broader search to find markets containing these tokens
-                    for token in missing_tokens[:5]:  # Limit to first 5 to avoid too many API calls
-                        logger.info(f"Searching for market containing token: {token[:20]}...")
-                        # This would need to be implemented in _fetch_markets_metadata
-                        # For now, we'll rely on the Selected Markets sheet fallback
-                except Exception as e:
-                    logger.warning(f"Markets API fallback failed: {e}")
+        # Positions path has no extra ad-hoc token fallback; keep logic aligned
         # No Google Sheets fallback; rely on Gamma/data APIs only
         
         total_orders = len(orders_df)
@@ -759,14 +745,18 @@ def get_positions(user=Depends(require_user)) -> Dict[str, Any]:
                         logger.info(f"Fetched metadata for {len(tm_f)} tokens, {len(to_f)} outcomes")
                         
                         if tm_f:
-                            # Map market names using token IDs
-                            pos_df["market_name"] = pos_df[asset_col].astype(str).map(tm_f).fillna("")
-                            logger.info(f"Mapped {pos_df['market_name'].notna().sum()} market names from assets API")
+                            # Map market names using token IDs; preserve existing names if mapping missing
+                            pos_df["market_name"] = (
+                                pos_df[asset_col].astype(str).map(tm_f).fillna(pos_df["market_name"])
+                            )
+                            logger.info(f"Mapped {pos_df['market_name'].notna().sum()} market names from assets API (preserving existing)")
                         
                         if to_f:
-                            # Map outcomes using token IDs
-                            pos_df["outcome"] = pos_df[asset_col].astype(str).map(to_f).fillna("")
-                            logger.info(f"Mapped {pos_df['outcome'].notna().sum()} outcomes from assets API")
+                            # Map outcomes using token IDs; preserve existing outcomes if mapping missing
+                            pos_df["outcome"] = (
+                                pos_df[asset_col].astype(str).map(to_f).fillna(pos_df["outcome"])
+                            )
+                            logger.info(f"Mapped {pos_df['outcome'].notna().sum()} outcomes from assets API (preserving existing)")
                 except Exception as e:
                     logger.warning(f"Error fetching assets metadata: {e}")
             else:
