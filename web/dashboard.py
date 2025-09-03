@@ -169,24 +169,65 @@ def _build_metadata_maps() -> Tuple[Dict[str, str], Dict[str, str], Dict[str, st
         df = getattr(global_state, "df", None)
         if df is not None and not df.empty:  # type: ignore[attr-defined]
             logger.info(f"Building metadata maps from sheet with {len(df)} rows")
-            # Expected columns: question, condition_id, token1, token2, answer1, answer2
+            logger.info(f"Sheet columns: {list(df.columns)}")
+            
+            # Try different column name variations
+            question_col = None
+            condition_col = None
+            token1_col = None
+            token2_col = None
+            answer1_col = None
+            answer2_col = None
+            
+            for col in df.columns:
+                col_lower = col.lower()
+                if 'question' in col_lower or 'title' in col_lower:
+                    question_col = col
+                elif 'condition' in col_lower or 'market' in col_lower:
+                    condition_col = col
+                elif 'token1' in col_lower or 'asset1' in col_lower:
+                    token1_col = col
+                elif 'token2' in col_lower or 'asset2' in col_lower:
+                    token2_col = col
+                elif 'answer1' in col_lower or 'outcome1' in col_lower:
+                    answer1_col = col
+                elif 'answer2' in col_lower or 'outcome2' in col_lower:
+                    answer2_col = col
+            
+            logger.info(f"Detected columns: question='{question_col}', condition='{condition_col}', token1='{token1_col}', token2='{token2_col}', answer1='{answer1_col}', answer2='{answer2_col}'")
+            
+            # Build mappings
             for _, r in df.iterrows():
-                q = str(r.get("question", ""))
-                m = str(r.get("condition_id", ""))
-                t1 = str(r.get("token1", ""))
-                t2 = str(r.get("token2", ""))
-                a1 = str(r.get("answer1", ""))
-                a2 = str(r.get("answer2", ""))
-                if m:
+                q = str(r.get(question_col, "")) if question_col else ""
+                m = str(r.get(condition_col, "")) if condition_col else ""
+                t1 = str(r.get(token1_col, "")) if token1_col else ""
+                t2 = str(r.get(token2_col, "")) if token2_col else ""
+                a1 = str(r.get(answer1_col, "")) if answer1_col else ""
+                a2 = str(r.get(answer2_col, "")) if answer2_col else ""
+                
+                # Log the first row for debugging
+                if _ == 0:
+                    logger.info(f"First row data: question='{q}', condition='{m}', token1='{t1}', token2='{t2}', answer1='{a1}', answer2='{a2}'")
+                
+                if m and m != "nan":
                     market_to_name[m] = q
-                if t1:
+                if t1 and t1 != "nan":
                     token_to_market[t1] = q
                     token_to_outcome[t1] = a1
-                if t2:
+                if t2 and t2 != "nan":
                     token_to_market[t2] = q
                     token_to_outcome[t2] = a2
             
             logger.info(f"Built maps: {len(token_to_market)} token->market, {len(token_to_outcome)} token->outcome, {len(market_to_name)} market->name")
+            
+            # Log some sample mappings for debugging
+            if token_to_market:
+                sample_tokens = list(token_to_market.items())[:3]
+                logger.info(f"Sample token->market mappings: {sample_tokens}")
+            if market_to_name:
+                sample_markets = list(market_to_name.items())[:3]
+                logger.info(f"Sample market->name mappings: {sample_markets}")
+                
         else:
             logger.warning("No sheet data available for building metadata maps")
     except Exception as e:
@@ -289,7 +330,7 @@ def _fetch_assets_metadata(
     token_ids: List[str],
 ) -> Tuple[Dict[str, str], Dict[str, str], Dict[str, str]]:
     """
-    Fetch metadata for given asset (token) IDs.
+    Fetch metadata for given asset (token) IDs using Gamma API.
 
     Returns:
         token_to_market_name, token_to_outcome, token_to_market_id
@@ -302,75 +343,114 @@ def _fetch_assets_metadata(
     token_to_outcome: Dict[str, str] = {}
     token_to_market_id: Dict[str, str] = {}
 
-    def harvest(items: List[Dict[str, Any]]) -> None:
-        for a in items:
+    def harvest_from_gamma(items: List[Dict[str, Any]]) -> None:
+        for item in items:
             try:
-                tid = a.get("id") or a.get("token_id") or a.get("asset_id") or a.get("tokenId")
+                # Extract token ID from various possible fields
+                tid = item.get("tokenId") or item.get("id") or item.get("token_id") or item.get("asset_id")
                 if tid is None:
                     continue
                 tid_s = str(tid)
-                mid = a.get("market") or a.get("conditionId") or a.get("market_id")
-                name = (a.get("market_title") or a.get("question") or a.get("title") or a.get("name"))
-                out = a.get("outcome") or a.get("answer") or a.get("title")
+                
+                # Extract market/condition ID
+                mid = item.get("conditionId") or item.get("marketId") or item.get("market_id")
+                
+                # Extract market name/question
+                name = (item.get("question") or item.get("title") or item.get("marketTitle") or 
+                       item.get("market_title") or item.get("name"))
+                
+                # Extract outcome/answer
+                out = (item.get("outcome") or item.get("answer") or item.get("outcomeTitle") or 
+                      item.get("outcome_title") or item.get("title"))
+                
                 if mid:
                     token_to_market_id[tid_s] = str(mid)
                 if name:
                     token_to_market_name[tid_s] = str(name)
                 if out:
                     token_to_outcome[tid_s] = str(out)
-            except Exception:
+                    
+                logger.debug(f"Processed token {tid_s}: market='{name}', outcome='{out}', conditionId='{mid}'")
+            except Exception as e:
+                logger.debug(f"Error processing item: {e}")
                 continue
 
     if not token_ids:
         logger.warning("No token IDs provided to _fetch_assets_metadata")
         return token_to_market_name, token_to_outcome, token_to_market_id
 
-    ids_param = ",".join(sorted(set([str(x) for x in token_ids if x])))
-    logger.info(f"Fetching assets metadata for {len(token_ids)} tokens from Polymarket APIs")
+    # Use Gamma API instead of CLOB
+    gamma_base_url = "https://gamma-api.polymarket.com"
     
-    for base in [
-        "https://clob.polymarket.com/assets?ids=",
-        "https://data-api.polymarket.com/assets?ids=",
-    ]:
+    logger.info(f"Fetching assets metadata for {len(token_ids)} tokens from Gamma API")
+    
+    # Process tokens in batches to avoid very long URLs
+    batch_size = 10
+    for i in range(0, len(token_ids), batch_size):
+        batch = token_ids[i:i + batch_size]
+        ids_param = ",".join(batch)
+        
         try:
-            url = base + ids_param
-            logger.debug(f"Trying API: {url}")
-            resp = requests.get(url, headers=headers, timeout=10)
-            if not resp.ok:
-                logger.warning(f"API request failed: {base} - Status: {resp.status_code}")
-                continue
-            data = resp.json()
-            items: List[Dict[str, Any]]
-            if isinstance(data, dict) and "assets" in data:
-                items = data.get("assets", [])
-            elif isinstance(data, list):
-                items = data
+            # Try to fetch from Gamma API using the tokens endpoint
+            url = f"{gamma_base_url}/tokens?ids={ids_param}"
+            logger.info(f"Trying Gamma API batch {i//batch_size + 1}: {url}")
+            
+            resp = requests.get(url, headers=headers, timeout=15)
+            if resp.ok:
+                data = resp.json()
+                items = data if isinstance(data, list) else data.get("tokens", []) if isinstance(data, dict) else []
+                
+                logger.info(f"Received {len(items)} items from Gamma API for batch {i//batch_size + 1}")
+                harvest_from_gamma(items)
+                
+                if token_to_market_name:
+                    batch_names = len([k for k in token_to_market_name.keys() if k in batch])
+                    logger.info(f"Successfully fetched metadata from Gamma API batch {i//batch_size + 1}: {batch_names} market names")
             else:
-                items = [data]
-            
-            logger.debug(f"Received {len(items)} items from {base}")
-            harvest(items)
-            
-            if token_to_market_name:
-                logger.info(f"Successfully fetched metadata from {base}: {len(token_to_market_name)} market names, {len(token_to_outcome)} outcomes")
-                break
+                logger.warning(f"Gamma API request failed for batch {i//batch_size + 1}: Status {resp.status_code}")
+                
         except Exception as e:
-            logger.warning(f"Error fetching from {base}: {e}")
+            logger.warning(f"Error fetching from Gamma API batch {i//batch_size + 1}: {e}")
             continue
 
-    # If we learned market IDs but not names, try to fetch names
-    unresolved_mids = sorted(set([
-        mid for tid, mid in token_to_market_id.items() if tid in token_to_market_name and not token_to_market_name.get(tid)
-    ]))
-    if unresolved_mids:
-        logger.info(f"Fetching market names for {len(unresolved_mids)} unresolved market IDs")
-        m2n, _ = _fetch_markets_metadata(unresolved_mids)
-        for tid, mid in token_to_market_id.items():
-            if tid not in token_to_market_name and mid in m2n:
-                token_to_market_name[tid] = m2n[mid]
-                logger.debug(f"Resolved market name for token {tid}: {m2n[mid]}")
+    # If we still don't have market names, try to fetch them using condition IDs
+    if token_to_market_id and not token_to_market_name:
+        logger.info("No market names from tokens endpoint, trying condition endpoint...")
+        condition_ids = list(set(token_to_market_id.values()))
+        
+        for i in range(0, len(condition_ids), batch_size):
+            batch = condition_ids[i:i + batch_size]
+            ids_param = ",".join(batch)
+            
+            try:
+                url = f"{gamma_base_url}/conditions?ids={ids_param}"
+                logger.info(f"Trying Gamma conditions API batch {i//batch_size + 1}: {url}")
+                
+                resp = requests.get(url, headers=headers, timeout=15)
+                if resp.ok:
+                    data = resp.json()
+                    items = data if isinstance(data, list) else data.get("conditions", []) if isinstance(data, dict) else []
+                    
+                    for item in items:
+                        try:
+                            condition_id = str(item.get("id") or item.get("conditionId"))
+                            if condition_id:
+                                name = item.get("question") or item.get("title") or item.get("name")
+                                if name:
+                                    # Find all tokens that map to this condition
+                                    for tid, cid in token_to_market_id.items():
+                                        if str(cid) == condition_id:
+                                            token_to_market_name[tid] = str(name)
+                                            logger.debug(f"Mapped token {tid} to market name '{name}' via condition {condition_id}")
+                        except Exception as e:
+                            logger.debug(f"Error processing condition item: {e}")
+                            continue
+                            
+            except Exception as e:
+                logger.warning(f"Error fetching from Gamma conditions API batch {i//batch_size + 1}: {e}")
+                continue
 
-    logger.info(f"Final assets metadata results: {len(token_to_market_name)} market names, {len(token_to_outcome)} outcomes, {len(token_to_market_id)} market IDs")
+    logger.info(f"Final Gamma API results: {len(token_to_market_name)} market names, {len(token_to_outcome)} outcomes, {len(token_to_market_id)} market IDs")
     return token_to_market_name, token_to_outcome, token_to_market_id
 
 
@@ -623,10 +703,16 @@ def get_positions(user=Depends(require_user)) -> Dict[str, Any]:
             if "outcome" not in pos_df.columns:
                 pos_df["outcome"] = ""
             
+            # 0) Use existing title column if available (most reliable)
+            if "title" in pos_df.columns and pos_df["title"].notna().any():
+                logger.info("Found title column, using it for market names")
+                pos_df["market_name"] = pos_df["title"].fillna("")
+                logger.info(f"Set {pos_df['title'].notna().sum()} market names from title column")
+            
             # Log the columns we have to debug
             logger.info(f"Position columns: {list(pos_df.columns)}")
             
-            # 1) Assets API by token IDs - this is the primary method
+            # 1) Assets API by token IDs - this is the secondary method
             # Look for asset column with different possible names
             asset_col = None
             for col in ["asset", "token_id", "tokenId", "asset_id"]:
@@ -657,7 +743,23 @@ def get_positions(user=Depends(require_user)) -> Dict[str, Any]:
             else:
                 logger.warning("No asset/token column found in positions data. Available columns: %s", list(pos_df.columns))
 
-            # 2) Markets API by market IDs for any still-missing names
+            # 2) Try to use conditionId column if available (this is more reliable)
+            if "conditionId" in pos_df.columns and pos_df["market_name"].eq("").any():
+                missing_conditions = sorted(set(pos_df.loc[pos_df["market_name"].eq("") & pos_df["conditionId"].notna(), "conditionId"].astype(str)))
+                if missing_conditions:
+                    logger.info(f"Found conditionId column, fetching market metadata for {len(missing_conditions)} conditions")
+                    m2n_f, t2o_f = _fetch_markets_metadata(missing_conditions)
+                    if m2n_f:
+                        pos_df.loc[pos_df["market_name"].eq("") & pos_df["conditionId"].notna(), "market_name"] = (
+                            pos_df.loc[pos_df["market_name"].eq("") & pos_df["conditionId"].notna(), "conditionId"].astype(str).map(m2n_f).fillna("")
+                        )
+                        logger.info(f"Updated {len(m2n_f)} market names using conditionId")
+                    if t2o_f and asset_col:
+                        mask = pos_df["outcome"].eq("") & pos_df[asset_col].notna()
+                        pos_df.loc[mask, "outcome"] = pos_df.loc[mask, asset_col].astype(str).map(t2o_f).fillna("")
+                        logger.info(f"Updated {len(t2o_f)} outcomes using conditionId")
+
+            # 3) Markets API by market IDs for any still-missing names (fallback)
             if "market_name" in pos_df.columns and pos_df["market_name"].eq("").any() and "market" in pos_df.columns:
                 missing_mids = sorted(set(pos_df.loc[pos_df["market_name"].eq("") & pos_df["market"].notna(), "market"].astype(str)))
                 if missing_mids:
@@ -673,7 +775,7 @@ def get_positions(user=Depends(require_user)) -> Dict[str, Any]:
                         pos_df.loc[mask, "outcome"] = pos_df.loc[mask, asset_col].astype(str).map(t2o_f).fillna("")
                         logger.info(f"Updated {len(t2o_f)} outcomes from markets API")
 
-            # 3) Fallback to sheet-based mappings
+            # 4) Fallback to sheet-based mappings
             t2m, t2o, m2n = _build_metadata_maps()
             logger.info(f"Built fallback maps: {len(t2m)} token->market, {len(t2o)} token->outcome, {len(m2n)} market->name")
             
