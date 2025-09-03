@@ -7,145 +7,7 @@ from py_clob_client.constants import POLYGON
 import requests
 
 
-def fetch_open_orders_enriched() -> pd.DataFrame:
-    """Return enriched open orders DataFrame with market_name resolved (same logic as script)."""
-    pk = os.getenv("PK")
-    funder = os.getenv("BROWSER_ADDRESS") or os.getenv("BROWSER_WALLET")
-    if not pk or not funder:
-        return pd.DataFrame()
-
-    client = ClobClient("https://clob.polymarket.com", key=pk, chain_id=POLYGON, funder=funder)
-    creds = client.create_or_derive_api_creds()
-    client.set_api_creds(creds)
-
-    orders = client.get_orders()
-    if not orders:
-        return pd.DataFrame()
-
-    df = pd.DataFrame(orders)
-    if "status" in df.columns:
-        df = df[df["status"].isin(["LIVE", "OPEN"])].copy()
-        if df.empty:
-            return df
-
-    token_to_name, market_to_name = {}, {}
-
-    def harvest(markets_json):
-        for m in markets_json:
-            name = m.get("question") or m.get("title") or m.get("name") or m.get("slug") or m.get("questionTitle") or ""
-            mid = m.get("id") or m.get("market") or m.get("conditionId")
-            if mid:
-                market_to_name[str(mid)] = name
-            for key in ("outcomes", "tokens", "outcomeTokens"):
-                if key in m and isinstance(m[key], list):
-                    for o in m[key]:
-                        if isinstance(o, dict):
-                            tid = o.get("token_id") or o.get("tokenId") or o.get("id")
-                            if tid:
-                                token_to_name[str(tid)] = name
-
-    # Bulk markets
-    try:
-        r = requests.get("https://clob.polymarket.com/markets?limit=1000", timeout=10)
-        if r.ok:
-            data = r.json()
-            harvest(data if isinstance(data, list) else data.get("markets", []))
-    except Exception:
-        pass
-    try:
-        r = requests.get("https://data-api.polymarket.com/markets?limit=1000", timeout=10)
-        if r.ok:
-            data = r.json()
-            harvest(data if isinstance(data, list) else data.get("markets", []))
-    except Exception:
-        pass
-
-    token_col = None
-    for cand in ("token_id", "asset_id", "tokenId", "assetId"):
-        if cand in df.columns:
-            token_col = cand
-            break
-    market_col = "market" if "market" in df.columns else None
-
-    # Apply token->name first if available
-    if token_col and token_to_name:
-        df["market_name"] = df[token_col].astype(str).map(token_to_name)
-    elif market_col and market_to_name:
-        df["market_name"] = df[market_col].astype(str).map(market_to_name)
-    else:
-        df["market_name"] = ""
-    df["market_name"] = df["market_name"].fillna("")
-
-    # Direct assets lookup for any missing
-    if token_col and df["market_name"].eq("").any():
-        unique_tokens = sorted(set(df.loc[df["market_name"].eq("") & df[token_col].notna(), token_col].astype(str)))
-        if unique_tokens:
-            for i in range(0, len(unique_tokens), 50):
-                chunk = unique_tokens[i:i+50]
-                qs = ",".join(chunk)
-                for url in (
-                    f"https://data-api.polymarket.com/assets?ids={qs}",
-                    f"https://clob.polymarket.com/assets?ids={qs}",
-                ):
-                    try:
-                        rr = requests.get(url, timeout=10)
-                        if rr.ok:
-                            arr = rr.json()
-                            if isinstance(arr, dict) and "assets" in arr:
-                                arr = arr["assets"]
-                            if isinstance(arr, list):
-                                for a in arr:
-                                    if not isinstance(a, dict):
-                                        continue
-                                    aid = str(a.get("id") or a.get("token_id") or a.get("tokenId") or "")
-                                    if not aid:
-                                        continue
-                                    mname = a.get("question") or a.get("market_question") or a.get("title") or a.get("name") or ""
-                                    if mname:
-                                        token_to_name[aid] = mname
-                                # Apply after successful url
-                                df.loc[df["market_name"].eq("") & df[token_col].notna(), "market_name"] = (
-                                    df.loc[df["market_name"].eq("") & df[token_col].notna(), token_col].astype(str).map(token_to_name).fillna("")
-                                )
-                                break
-                    except Exception:
-                        continue
-
-    # Per-market lookups for any still-missing
-    if market_col and df["market_name"].eq("").any():
-        unique_markets = sorted(set(df.loc[df["market_name"].eq("") & df[market_col].notna(), market_col].astype(str)))
-        for mid in unique_markets:
-            urls = [
-                f"https://clob.polymarket.com/markets/{mid}",
-                f"https://data-api.polymarket.com/markets/{mid}",
-                f"https://clob.polymarket.com/markets?ids={mid}",
-                f"https://data-api.polymarket.com/markets?ids={mid}",
-            ]
-            for url in urls:
-                try:
-                    resp = requests.get(url, timeout=8)
-                    if not resp.ok:
-                        continue
-                    data = resp.json()
-                    items = data["markets"] if isinstance(data, dict) and "markets" in data else data if isinstance(data, list) else [data]
-                    harvest(items)
-                    if str(mid) in market_to_name and market_to_name[str(mid)]:
-                        # Apply incrementally
-                        mask = df["market_name"].eq("") & df[market_col].astype(str).eq(str(mid))
-                        df.loc[mask, "market_name"] = market_to_name[str(mid)]
-                        break
-                except Exception:
-                    continue
-
-    # Ensure column exists and fillna
-    if "market_name" not in df.columns:
-        df["market_name"] = ""
-    df["market_name"] = df["market_name"].fillna("")
-
-    return df
-
-
-def main() -> None:
+def get_open_orders() -> None:
     load_dotenv()
     pk = os.getenv("PK")
     funder = os.getenv("BROWSER_ADDRESS")
@@ -280,6 +142,13 @@ def main() -> None:
     else:
         df["market_name"] = ""
     df["market_name"] = df["market_name"].fillna("")
+
+    return df
+
+
+if __name__ == "__main__":
+    df = get_open_orders()
+    # Pretty print
     cols = [
         "order_id",
         "token_id",
@@ -298,11 +167,5 @@ def main() -> None:
     # Sort newest first if available
     if "created_at" in df.columns:
         df = df.sort_values("created_at", ascending=False)
-
-    # Pretty print
     with pd.option_context('display.max_rows', None, 'display.max_columns', None):
         print(df[existing].to_string(index=False))
-
-
-if __name__ == "__main__":
-    main()

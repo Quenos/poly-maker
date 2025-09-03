@@ -1021,15 +1021,15 @@ def get_pnl_trades(limit: int = 100, page: int = 1, user=Depends(require_user)) 
 
 @app.get("/api/orders")
 def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
-    """Return open orders using the exact enrichment logic from list_open_orders.py."""
+    """Return open orders using shared logic in poly_utils.open_orders.get_open_orders."""
     try:
-        from list_open_orders import fetch_open_orders_enriched  # type: ignore
+        from poly_utils.open_orders import get_open_orders as _get_open_orders_df  # type: ignore
     except Exception as exc:
-        logger.exception("Unable to import fetch_open_orders_enriched: %s", str(exc))
-        raise HTTPException(status_code=500, detail="list_open_orders helper not available")
+        logger.exception("Unable to import get_open_orders: %s", str(exc))
+        raise HTTPException(status_code=500, detail="open orders helper not available")
 
     try:
-        df = fetch_open_orders_enriched()
+        df = _get_open_orders_df()
         if df is None or df.empty:
             return {"data": []}
         wanted = [
@@ -1044,5 +1044,5 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
         records = _df_to_records(df, wanted)
         return {"data": records}
     except Exception as exc:
-        logger.exception("Failed to fetch open orders via list_open_orders: %s", str(exc))
+        logger.exception("Failed to fetch open orders via poly_utils.open_orders: %s", str(exc))
         raise HTTPException(status_code=500, detail="Failed to fetch open orders")
