@@ -13,6 +13,7 @@ import requests
 from mm.config import load_config
 from mm.market_data import MarketData
 from mm.orders import OrdersClient
+from mm.orders import NonRetryableOrderError
 from mm.state import StateStore
 from mm.strategy import AvellanedaLite, build_layered_quotes, should_requote
 from mm.risk import RiskManager
@@ -273,6 +274,7 @@ async def main_async(test_mode: bool = False) -> None:
     last_quote_ts: Dict[str, float] = {}
     last_mid_seen: Dict[str, float] = {}
     halt_event = asyncio.Event()
+    cooldown_until: Dict[str, float] = {}
 
     # Selection supervisor (15 min re-pull)
     sel = SelectionManager(cfg.gamma_base_url, state_store=state)
@@ -383,6 +385,12 @@ async def main_async(test_mode: bool = False) -> None:
                 book = md.books.get(market_id)
                 if not book:
                     continue
+                # Skip orders during per-token cooldown
+                now_ts = time.time()
+                until = cooldown_until.get(token)
+                if until is not None and now_ts < until:
+                    logger.debug("Cooldown active for token %s for %.1fs", token, until - now_ts)
+                    continue
                 # Inventory-aware: estimate inventory_usd from shares * mid
                 shares = positions_by_token.get(token, 0.0)
                 mid = book.mid() or 0.0
@@ -445,6 +453,9 @@ async def main_async(test_mode: bool = False) -> None:
                     last_quote_ts[token] = time.time()
                     if mid_now is not None:
                         last_mid_seen[token] = mid_now
+                except NonRetryableOrderError as nre:
+                    logger.warning("Non-retryable order error for token %s: %s", token, nre)
+                    cooldown_until[token] = time.time() + float(cfg.nonretryable_cooldown_sec)
                 except Exception:
                     logger.exception("Order placement failed for token %s", token)
             await asyncio.sleep(1.0)

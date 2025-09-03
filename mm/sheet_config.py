@@ -46,6 +46,8 @@ class MMConfig:
     requote_queue_levels: int = 2
     order_max_age_sec: int = 12
     daily_loss_limit_pct: float = 1.0
+    # Non-retryable error backoff
+    nonretryable_cooldown_sec: int = 60
 
     # Networking
     gamma_base_url: str = "https://gamma-api.polymarket.com"
@@ -201,6 +203,8 @@ def load_config() -> MMConfig:
         requote_mid_ticks=_get_int("REQUOTE_MID_TICKS", 1, sheet_settings),
         requote_queue_levels=_get_int("REQUOTE_QUEUE_LEVELS", 2, sheet_settings),
         order_max_age_sec=_get_int("ORDER_MAX_AGE_SEC", 12, sheet_settings),
+        # Backoff / cooldowns
+        nonretryable_cooldown_sec=_get_int("NONRETRYABLE_COOLDOWN_SEC", 60, sheet_settings),
         
         # Networking
         gamma_base_url=_get_string("GAMMA_BASE_URL", "https://gamma-api.polymarket.com", sheet_settings),

@@ -4,11 +4,20 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from py_clob_client.client import ClobClient
+from py_clob_client.exceptions import PolyApiException
 from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
 from py_clob_client.constants import POLYGON
-from tenacity import retry, stop_after_attempt, wait_exponential_jitter
+from tenacity import retry, stop_after_attempt, wait_exponential_jitter, retry_if_exception_type
 
 from mm.state import StateStore, OrderRecord
+
+
+class NonRetryableOrderError(Exception):
+    """Raised when an order error should not be retried (e.g., insufficient allowance/balance)."""
+
+
+class RetryableOrderError(Exception):
+    """Raised to trigger a retry via tenacity for transient errors."""
 
 
 class OrdersClient:
@@ -20,16 +29,40 @@ class OrdersClient:
         self.client.set_api_creds(creds=creds)
         self.state = state
 
-    @retry(stop=stop_after_attempt(3), wait=wait_exponential_jitter(0.1, 1.0))
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential_jitter(0.1, 1.0),
+        retry=retry_if_exception_type(RetryableOrderError),
+    )
     def place_order(self, token_id: str, side: str, price: float, size: float, neg_risk: bool = False) -> dict:
-        args = OrderArgs(token_id=str(token_id), price=price, size=size, side=side)
-        options = PartialCreateOrderOptions(neg_risk=True) if neg_risk else None
-        signed = self.client.create_order(args, options=options) if options else self.client.create_order(args)
-        resp = self.client.post_order(signed)
-        order_id = str(resp.get("order_id") or resp.get("id") or f"p_{int(time.time()*1000)}_{random.randint(1,9999)}")
-        if getattr(self, "state", None) is not None:
-            self.state.record_order(OrderRecord(order_id=order_id, token_id=token_id, side=side, price=price, size=size, timestamp=time.time()))
-        return resp
+        try:
+            args = OrderArgs(token_id=str(token_id), price=price, size=size, side=side)
+            options = PartialCreateOrderOptions(neg_risk=True) if neg_risk else None
+            signed = self.client.create_order(args, options=options) if options else self.client.create_order(args)
+            resp = self.client.post_order(signed)
+            order_id = str(resp.get("order_id") or resp.get("id") or f"p_{int(time.time()*1000)}_{random.randint(1,9999)}")
+            if getattr(self, "state", None) is not None:
+                self.state.record_order(
+                    OrderRecord(
+                        order_id=order_id,
+                        token_id=token_id,
+                        side=side,
+                        price=price,
+                        size=size,
+                        timestamp=time.time(),
+                    )
+                )
+            return resp
+        except PolyApiException as exc:
+            # Detect insufficient allowance/balance and avoid retrying
+            message = str(getattr(exc, "error_message", "") or str(exc)).lower()
+            if "not enough balance" in message or "not enough allowance" in message or "balance / allowance" in message:
+                raise NonRetryableOrderError(message)
+            # Treat other PolyApiException as retryable
+            raise RetryableOrderError(str(exc))
+        except Exception as exc:
+            # Unknown/transient errors: retry
+            raise RetryableOrderError(str(exc))
 
     def cancel_market_orders(self, market: Optional[str] = None, asset_id: Optional[str] = None) -> None:
         if market:
@@ -145,12 +178,7 @@ class OrdersEngine:
             orig = float(o.get("original_size") or o.get("size") or 0.0)
             pct = (filled / orig * 100.0) if orig > 0 else 0.0
             queue_loss = 0  # placeholder proxy; can be enhanced with book depth
-            must_replace = (
-                self._needs_replace_due_to_age(oid)
-                or (pct >= self.partial_fill_pct)
-                or (queue_loss >= self.requote_queue_levels)
-                or (token in requote_tokens)
-            )
+            must_replace = (self._needs_replace_due_to_age(oid) or (pct >= self.partial_fill_pct) or (queue_loss >= self.requote_queue_levels) or (token in requote_tokens))
             if must_replace or abs(float(o.get("price", 0.0)) - dq.price) >= self.tick:
                 # Replace: cancel then place new
                 try:
@@ -190,4 +218,3 @@ class OrdersEngine:
                     pass
 
         return actions
-
