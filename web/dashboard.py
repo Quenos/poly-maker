@@ -592,6 +592,52 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
             if "market" in orders_df.columns and m2n_bulk:
                 orders_df["market_name"] = orders_df["market"].astype(str).map(m2n_bulk).fillna(orders_df["market_name"])
                 logger.info("Filled market names from market id map")
+
+        # 0b) If still empty, query assets endpoint directly for the tokens in these orders (like list_open_orders)
+        asset_col_2 = None
+        for col in ("token_id", "asset_id", "tokenId", "assetId", "asset"):
+            if col in orders_df.columns:
+                asset_col_2 = col
+                break
+        if asset_col_2 and orders_df["market_name"].eq("").any():
+            try:
+                unique_tokens = sorted(set(orders_df.loc[orders_df["market_name"].eq("") & orders_df[asset_col_2].notna(), asset_col_2].astype(str)))
+            except Exception:
+                unique_tokens = []
+            if unique_tokens:
+                token_to_name_direct: Dict[str, str] = {}
+                for i in range(0, len(unique_tokens), 50):
+                    chunk = unique_tokens[i:i+50]
+                    qs = ",".join(chunk)
+                    for url in (
+                        f"https://data-api.polymarket.com/assets?ids={qs}",
+                        f"https://clob.polymarket.com/assets?ids={qs}",
+                    ):
+                        try:
+                            rr = requests.get(url, timeout=10)
+                            if not rr.ok:
+                                continue
+                            arr = rr.json()
+                            if isinstance(arr, dict) and "assets" in arr:
+                                arr = arr["assets"]
+                            if isinstance(arr, list):
+                                for a in arr:
+                                    if not isinstance(a, dict):
+                                        continue
+                                    aid = str(a.get("id") or a.get("token_id") or a.get("tokenId") or "")
+                                    if not aid:
+                                        continue
+                                    mname = (a.get("question") or a.get("market_question") or a.get("title") or a.get("name") or "")
+                                    if mname:
+                                        token_to_name_direct[aid] = str(mname)
+                                break  # break URL loop if one succeeded
+                        except Exception:
+                            continue
+                if token_to_name_direct:
+                    mask_empty = orders_df["market_name"].eq("") & orders_df[asset_col_2].notna()
+                    orders_df.loc[mask_empty, "market_name"] = orders_df.loc[mask_empty, asset_col_2].astype(str).map(token_to_name_direct).fillna("")
+                    after_filled = int(orders_df.loc[orders_df["market_name"].ne("") & mask_empty, "market_name"].shape[0])
+                    logger.info(f"Filled {after_filled} market names from assets endpoint direct mapping")
         
         # 1) Use existing title column to fill any still-empty names
         if "title" in orders_df.columns and orders_df["title"].notna().any():

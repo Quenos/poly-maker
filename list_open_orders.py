@@ -35,6 +35,7 @@ def main() -> None:
     print(f"Order fields: {list(df.columns)}")
     # Fetch market metadata to map token_id/asset_id/market -> market name (robust to schema changes)
     token_to_name, market_to_name = {}, {}
+
     def harvest(markets_json):
         for m in markets_json:
             name = m.get("question") or m.get("title") or m.get("name") or m.get("slug") or m.get("questionTitle") or ""
@@ -167,5 +168,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-
