@@ -5,10 +5,17 @@ Run this script to migrate from environment variables to Google Sheets-based con
 """
 
 import logging
+import os
+import sys
 import pandas as pd
 from dotenv import load_dotenv
-from poly_utils.google_utils import get_spreadsheet
 from gspread_dataframe import set_with_dataframe
+from poly_utils.google_utils import get_spreadsheet
+
+# Allow running as a script: add project root to sys.path for sibling package imports
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
 
 # Load environment variables
 load_dotenv()
@@ -228,35 +235,105 @@ def create_settings_sheet():
             'default': 'Selected Markets'
         }
     ]
+
+    # Merger settings (added without overwriting existing values)
+    merger_settings = [
+        {
+            'setting_name': 'MERGE_SCAN_INTERVAL_SEC',
+            'value': '120',
+            'type': 'int',
+            'category': 'Merger',
+            'description': 'Interval between merger scans (seconds)',
+            'default': '120'
+        },
+        {
+            'setting_name': 'MIN_MERGE_USDC',
+            'value': '0.10',
+            'type': 'float',
+            'category': 'Merger',
+            'description': 'Minimum overlap (USDC) required to trigger merging',
+            'default': '0.10'
+        },
+        {
+            'setting_name': 'MERGE_CHUNK_USDC',
+            'value': '0.25',
+            'type': 'float',
+            'category': 'Merger',
+            'description': 'Chunk size (USDC) per merger transaction',
+            'default': '0.25'
+        },
+        {
+            'setting_name': 'MERGE_MAX_RETRIES',
+            'value': '3',
+            'type': 'int',
+            'category': 'Merger',
+            'description': 'Maximum retries per market per scan cycle',
+            'default': '3'
+        },
+        {
+            'setting_name': 'MERGE_RETRY_BACKOFF_MS',
+            'value': '500',
+            'type': 'int',
+            'category': 'Merger',
+            'description': 'Backoff between retries (milliseconds)',
+            'default': '500'
+        },
+        {
+            'setting_name': 'MERGE_DRY_RUN',
+            'value': 'false',
+            'type': 'bool',
+            'category': 'Merger',
+            'description': 'If true, log planned merges without calling the helper',
+            'default': 'false'
+        },
+    ]
+    # Combine all settings for initial creation
+    all_settings = settings_data + merger_settings
     
     # Convert to DataFrame
-    df = pd.DataFrame(settings_data)
-    
+    df_all = pd.DataFrame(all_settings)
     # Reorder columns for better readability
-    df = df[['category', 'setting_name', 'value', 'type', 'default', 'description']]
+    df_all = df_all[['category', 'setting_name', 'value', 'type', 'default', 'description']]
     
     try:
         # Check if Settings sheet already exists
         try:
             existing_sheet = spreadsheet.worksheet('Settings')
-            logger.info("Settings sheet already exists, updating it...")
-            # Clear existing content and update
-            existing_sheet.clear()
-            set_with_dataframe(existing_sheet, df, include_index=False)
+            logger.info("Settings sheet exists; will append only missing settings (no overwrite)")
+            # Read existing settings
+            records = existing_sheet.get_all_records()
+            existing_names = set()
+            if records:
+                try:
+                    existing_df = pd.DataFrame(records)
+                    if 'setting_name' in existing_df.columns:
+                        existing_names = set(existing_df['setting_name'].astype(str).tolist())
+                except Exception:
+                    existing_names = set()
+            # Determine missing merger settings
+            missing = [row for row in merger_settings if row['setting_name'] not in existing_names]
+            if not missing:
+                logger.info("No new merger settings to add.")
+            else:
+                # Append rows in expected column order
+                rows = [[m['category'], m['setting_name'], m['value'], m['type'], m['default'], m['description']] for m in missing]
+                # Ensure header exists; append after last row
+                existing_sheet.append_rows(rows, value_input_option='RAW')
+                logger.info("Appended %d merger settings without overwriting existing values", len(rows))
         except Exception:
-            # Create new sheet
-            logger.info("Creating new Settings sheet...")
-            new_sheet = spreadsheet.add_worksheet(title='Settings', rows=len(df) + 1, cols=len(df.columns))
-            set_with_dataframe(new_sheet, df, include_index=False)
+            # Create new sheet with all settings
+            logger.info("Creating new Settings sheet with full defaults (including merger settings)...")
+            new_sheet = spreadsheet.add_worksheet(title='Settings', rows=len(df_all) + 1, cols=len(df_all.columns))
+            set_with_dataframe(new_sheet, df_all, include_index=False)
         
-        logger.info("Successfully created/updated Settings sheet with %d configuration parameters", len(df))
+        logger.info("Settings sheet ensured. Merger defaults added if missing.")
         
         # Print summary
         print("\n📋 Settings Sheet Created Successfully!")
-        print(f"📊 Total settings: {len(df)}")
+        print(f"📊 Total settings (defined): {len(df_all)}")
         print("📁 Categories:")
-        for category in df['category'].unique():
-            count = len(df[df['category'] == category])
+        for category in df_all['category'].unique():
+            count = len(df_all[df_all['category'] == category])
             print(f"   • {category}: {count} settings")
         print("\n🔧 Next steps:")
         print("   1. Review the Settings sheet in Google Sheets")

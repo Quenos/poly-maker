@@ -48,6 +48,13 @@ class MMConfig:
     daily_loss_limit_pct: float = 1.0
     # Non-retryable error backoff
     nonretryable_cooldown_sec: int = 60
+    # Merger settings
+    merge_scan_interval_sec: int = 120
+    min_merge_usdc: float = 0.10
+    merge_chunk_usdc: float = 0.25
+    merge_max_retries: int = 3
+    merge_retry_backoff_ms: int = 500
+    merge_dry_run: bool = False
 
     # Networking
     gamma_base_url: str = "https://gamma-api.polymarket.com"
@@ -156,6 +163,27 @@ def _get_string(name: str, default: str, sheet_settings: Dict[str, Any]) -> str:
     return os.getenv(name, default)
 
 
+def _get_bool(name: str, default: bool, sheet_settings: Dict[str, Any]) -> bool:
+    # Try sheet first
+    if name in sheet_settings:
+        v = sheet_settings[name]
+        if isinstance(v, bool):
+            return v
+        try:
+            sv = str(v).strip().lower()
+            return sv in ("1", "true", "yes", "y", "t")
+        except Exception:
+            pass
+    # Fallback to environment variable
+    envv = os.getenv(name)
+    if envv is None:
+        return default
+    try:
+        return str(envv).strip().lower() in ("1", "true", "yes", "y", "t")
+    except Exception:
+        return default
+
+
 def load_config() -> MMConfig:
     """Load configuration from Google Sheets Settings worksheet with fallbacks to env and defaults.
 
@@ -203,6 +231,13 @@ def load_config() -> MMConfig:
         requote_mid_ticks=_get_int("REQUOTE_MID_TICKS", 1, sheet_settings),
         requote_queue_levels=_get_int("REQUOTE_QUEUE_LEVELS", 2, sheet_settings),
         order_max_age_sec=_get_int("ORDER_MAX_AGE_SEC", 12, sheet_settings),
+        # Merger
+        merge_scan_interval_sec=_get_int("MERGE_SCAN_INTERVAL_SEC", 120, sheet_settings),
+        min_merge_usdc=_get_float("MIN_MERGE_USDC", 0.10, sheet_settings),
+        merge_chunk_usdc=_get_float("MERGE_CHUNK_USDC", 0.25, sheet_settings),
+        merge_max_retries=_get_int("MERGE_MAX_RETRIES", 3, sheet_settings),
+        merge_retry_backoff_ms=_get_int("MERGE_RETRY_BACKOFF_MS", 500, sheet_settings),
+        merge_dry_run=_get_bool("MERGE_DRY_RUN", False, sheet_settings),
         # Backoff / cooldowns
         nonretryable_cooldown_sec=_get_int("NONRETRYABLE_COOLDOWN_SEC", 60, sheet_settings),
         

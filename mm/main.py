@@ -204,17 +204,27 @@ async def main_async(test_mode: bool = False) -> None:
 
     # Build token->market mapping (use condition_id or Gamma conditionId)
     token_to_market: Dict[str, str] = {}
+    # Map any token to its token1 (canonical) for fair price computation
+    token_to_token1: Dict[str, str] = {}
+    # Track token pairs (token1, token2) for symmetric processing
+    token_pairs: List[tuple[str, str]] = []
     cond_col = "condition_id" if "condition_id" in enriched.columns else ("conditionId" if "conditionId" in enriched.columns else None)
     if cond_col is not None:
         for _, row in enriched.iterrows():
             market_hex = str(row.get(cond_col) or "").strip()
             if not market_hex:
                 continue
-            for tok_col in ("token1", "token2"):
-                if tok_col in enriched.columns:
-                    tok = str(row.get(tok_col) or "").strip()
-                    if tok:
-                        token_to_market[tok] = market_hex
+            t1 = str(row.get("token1") or "").strip() if "token1" in enriched.columns else ""
+            t2 = str(row.get("token2") or "").strip() if "token2" in enriched.columns else ""
+            if t1:
+                token_to_market[t1] = market_hex
+                token_to_token1[t1] = t1
+            if t2:
+                token_to_market[t2] = market_hex
+                if t1:
+                    token_to_token1[t2] = t1
+            if t1 and t2:
+                token_pairs.append((t1, t2))
 
     # Build token id list strictly from token1/token2
     token_ids: List[str] = []
@@ -273,8 +283,10 @@ async def main_async(test_mode: bool = False) -> None:
     # Main loop: compute quotes and place layered orders (skeleton)
     last_quote_ts: Dict[str, float] = {}
     last_mid_seen: Dict[str, float] = {}
+    last_fair_seen: Dict[str, float] = {}
     halt_event = asyncio.Event()
     cooldown_until: Dict[str, float] = {}
+    _last_heartbeat: float = 0.0
 
     # Selection supervisor (15 min re-pull)
     sel = SelectionManager(cfg.gamma_base_url, state_store=state)
@@ -305,17 +317,22 @@ async def main_async(test_mode: bool = False) -> None:
                     _, enr = sel.pull()
                     old_market_count = len(token_to_market)
                     token_to_market.clear()
+                    token_to_token1.clear()
                     cond_col2 = "condition_id" if "condition_id" in enr.columns else ("conditionId" if "conditionId" in enr.columns else None)
                     if cond_col2 is not None:
                         for _, row in enr.iterrows():
                             mhex = str(row.get(cond_col2) or "").strip()
                             if not mhex:
                                 continue
-                            for tc in ("token1", "token2"):
-                                if tc in enr.columns:
-                                    tval = str(row.get(tc) or "").strip()
-                                    if tval:
-                                        token_to_market[tval] = mhex
+                            t1v = str(row.get("token1") or "").strip() if "token1" in enr.columns else ""
+                            t2v = str(row.get("token2") or "").strip() if "token2" in enr.columns else ""
+                            if t1v:
+                                token_to_market[t1v] = mhex
+                                token_to_token1[t1v] = t1v
+                            if t2v:
+                                token_to_market[t2v] = mhex
+                                if t1v:
+                                    token_to_token1[t2v] = t1v
                     
                     logger.info("Market mappings: %d -> %d", old_market_count, len(token_to_market))
                     
@@ -377,87 +394,174 @@ async def main_async(test_mode: bool = False) -> None:
             positions_by_token = _fetch_positions_by_token(wallet) if wallet else {}
             nav_usd = _fetch_nav_usd(wallet) if wallet else 0.0
 
-            for token in token_ids:
-                market_id = token_to_market.get(token)
-                if not market_id:
-                    logger.debug("No market mapping for token %s; skipping", token)
+            # Heartbeat every 5s to confirm loop is alive
+            try:
+                now_hb = time.time()
+                if now_hb - _last_heartbeat >= 5.0:
+                    logger.debug("MM tick: tokens=%d books=%d", len(token_ids), len(md.books))
+                    _last_heartbeat = now_hb
+            except Exception:
+                pass
+
+            # Process by token pairs to ensure token1/token2 consistency
+            # Quote strictly by token pairs to avoid side mixing
+            for t1 in list({p[0] for p in token_pairs}):
+                # Find paired token2 for this t1 (first match)
+                t2 = next((p[1] for p in token_pairs if p[0] == t1), None)
+                cid = token_to_market.get(t1) or token_to_market.get(t2 or "") or "-"
+                # Token1 book and fair (books are keyed by DECIMAL token ids)
+                book1 = md.books.get(t1)
+                if not book1:
+                    logger.debug("No orderbook for token1=%s (market=%s)", t1, cid)
                     continue
-                book = md.books.get(market_id)
-                if not book:
+                bb1 = book1.best_bid()
+                ba1 = book1.best_ask()
+                if bb1 is None and ba1 is None:
+                    now_bf = time.time()
+                    # throttle backfill to once per 10s per token1
+                    globals_dict = globals()
+                    if "_last_backfill_at" not in globals_dict:
+                        globals_dict["_last_backfill_at"] = {}
+                    _lba = globals_dict["_last_backfill_at"]
+                    last_ts = _lba.get(t1, 0.0)
+                    if now_bf - last_ts > 10.0:
+                        try:
+                            md.backfill_top_of_book([t1])
+                        except Exception:
+                            logger.exception("token1 REST backfill failed for %s", t1)
+                        _lba[t1] = now_bf
+                    # skip this pair for now; next loop should have levels
                     continue
-                # Skip orders during per-token cooldown
-                now_ts = time.time()
-                until = cooldown_until.get(token)
-                if until is not None and now_ts < until:
-                    logger.debug("Cooldown active for token %s for %.1fs", token, until - now_ts)
+                if bb1 is None and ba1 is None:
+                    logger.debug("No best levels for token1=%s", t1)
                     continue
-                # Inventory-aware: estimate inventory_usd from shares * mid
-                shares = positions_by_token.get(token, 0.0)
-                mid = book.mid() or 0.0
-                inventory_usd = shares * mid
-                q = strategies[token].compute_quote(book, 0.0)
-                if q is None:
-                    continue
-                mid_now = book.mid()
-                if not should_requote(
-                    last_mid=last_mid_seen.get(token),
-                    current_mid=mid_now,
-                    last_timestamp=last_quote_ts.get(token),
-                    order_max_age_sec=cfg.order_max_age_sec,
-                    requote_mid_ticks=cfg.requote_mid_ticks,
-                ):
-                    continue
-                lq = build_layered_quotes(
-                    base_quote=q,
-                    layers=cfg.order_layers,
-                    base_size=cfg.base_size_usd,
-                    max_size=cfg.max_size_usd,
-                )
-                # Apply risk manager multipliers to spreads/gamma at the strategy level if using advanced
-                adj = risk.apply(
-                    state=type("S", (), {
-                        "fair": mid_now or mid,
-                        "sigma": 0.0,
-                        "inventory_usd": inventory_usd,
-                        "bankroll_usd": nav_usd if nav_usd > 0 else 1.0,
-                        "time_to_resolution_sec": 24 * 3600.0,
-                        "tick": 0.01,
-                    })(),
-                    token_id=token,
-                    nav_usd=nav_usd,
-                )
-                # Reflect size multiplier from risk
-                if adj.size_multiplier != 1.0:
-                    lq = type(lq)(
-                        bid_prices=lq.bid_prices,
-                        ask_prices=lq.ask_prices,
-                        sizes=[s * adj.size_multiplier for s in lq.sizes],
-                        timestamp=lq.timestamp,
+                if bb1 is not None and ba1 is not None:
+                    mid1 = (float(bb1) + float(ba1)) / 2.0
+                    if bb1 > ba1:
+                        low, high = float(ba1), float(bb1)
+                        mid1 = min(max(mid1, low), high)
+                elif bb1 is not None:
+                    mid1 = float(bb1)
+                else:
+                    mid1 = float(ba1)
+                mid1 = float(min(0.99, max(0.01, mid1)))
+                mid2 = float(min(0.99, max(0.01, 1.0 - mid1)))
+                last_fair_seen[t1] = mid1
+                if t2:
+                    last_fair_seen[t2] = mid2
+
+                # Quote helper for a single token
+                def _quote_token(tok: str, fair_mid_val: float) -> None:
+                    # Cooldown
+                    now_ts = time.time()
+                    until = cooldown_until.get(tok)
+                    if until is not None and now_ts < until:
+                        logger.debug("Cooldown active for token %s for %.1fs", tok, until - now_ts)
+                        return
+                    bookx = md.books.get(tok)
+                    if not bookx:
+                        logger.debug("No orderbook for token=%s (market=%s)", tok, cid)
+                        return
+                    shares = positions_by_token.get(tok, 0.0)
+                    inventory_usd = shares * fair_mid_val
+                    strat = strategies.get(tok) or AvellanedaLite(
+                        alpha_fair=cfg.alpha_fair,
+                        k_vol=cfg.k_vol,
+                        k_fee_ticks=cfg.k_fee_ticks,
+                        inv_gamma=cfg.inv_gamma,
                     )
-                logger.info(
-                    "Quoting token=%s market=%s mid=%.4f bid=%.4f ask=%.4f layers=%d",
-                    token,
-                    market_id,
-                    (mid_now if mid_now is not None else -1.0),
-                    q.bid,
-                    q.ask,
-                    cfg.order_layers,
-                )
-                try:
-                    for price, size in zip(lq.bid_prices, lq.sizes):
-                        if size > 0:
-                            orders.place_order(token, "BUY", price, size)
-                    for price, size in zip(lq.ask_prices, lq.sizes):
-                        if size > 0:
-                            orders.place_order(token, "SELL", price, size)
-                    last_quote_ts[token] = time.time()
-                    if mid_now is not None:
-                        last_mid_seen[token] = mid_now
-                except NonRetryableOrderError as nre:
-                    logger.warning("Non-retryable order error for token %s: %s", token, nre)
-                    cooldown_until[token] = time.time() + float(cfg.nonretryable_cooldown_sec)
-                except Exception:
-                    logger.exception("Order placement failed for token %s", token)
+                    strategies[tok] = strat
+                    # Drive strategy sigma/microprice off token1 orderbook consistently
+                    quote = strat.compute_quote(book1, 0.0, fair_hint=fair_mid_val)
+                    if quote is None:
+                        return
+                    if not should_requote(
+                        last_mid=last_mid_seen.get(tok),
+                        current_mid=fair_mid_val,
+                        last_timestamp=last_quote_ts.get(tok),
+                        order_max_age_sec=cfg.order_max_age_sec,
+                        requote_mid_ticks=cfg.requote_mid_ticks,
+                    ):
+                        return
+                    lq = build_layered_quotes(
+                        base_quote=quote,
+                        layers=cfg.order_layers,
+                        base_size=cfg.base_size_usd,
+                        max_size=cfg.max_size_usd,
+                    )
+                    adj = risk.apply(
+                        state=type("S", (), {
+                            "fair": fair_mid_val,
+                            "sigma": 0.0,
+                            "inventory_usd": inventory_usd,
+                            "bankroll_usd": nav_usd if nav_usd > 0 else 1.0,
+                            "time_to_resolution_sec": 24 * 3600.0,
+                            "tick": 0.01,
+                        })(),
+                        token_id=tok,
+                        nav_usd=nav_usd,
+                    )
+                    if adj.size_multiplier != 1.0:
+                        lq = type(lq)(
+                            bid_prices=lq.bid_prices,
+                            ask_prices=lq.ask_prices,
+                            sizes=[s * adj.size_multiplier for s in lq.sizes],
+                            timestamp=lq.timestamp,
+                        )
+                    api_bid = bookx.best_bid()
+                    api_ask = bookx.best_ask()
+                    logger.info(
+                        "Quoting token=%s market=%s mid=%.4f bid=%.4f ask=%.4f layers=%d",
+                        tok,
+                        cid,
+                        fair_mid_val,
+                        (api_bid if api_bid is not None else -1.0),
+                        (api_ask if api_ask is not None else -1.0),
+                        cfg.order_layers,
+                    )
+                    try:
+                        for price, size in zip(lq.bid_prices, lq.sizes):
+                            if size > 0:
+                                orders.place_order(tok, "BUY", price, size)
+                        for price, size in zip(lq.ask_prices, lq.sizes):
+                            if size > 0:
+                                orders.place_order(tok, "SELL", price, size)
+                        last_quote_ts[tok] = time.time()
+                        last_mid_seen[tok] = fair_mid_val
+                    except NonRetryableOrderError as nre:
+                        logger.warning("Non-retryable order error for token %s: %s", tok, nre)
+                        cooldown_until[tok] = time.time() + float(cfg.nonretryable_cooldown_sec)
+                    except Exception:
+                        logger.exception("Order placement failed for token %s", tok)
+
+                _quote_token(t1, mid1)
+                if t2:
+                    _quote_token(t2, mid2)
+            # Also process explicit token pairs to ensure token2 mid=1-mid(token1)
+            for t1, t2 in token_pairs:
+                cid = token_to_market.get(t1) or token_to_market.get(t2) or "-"
+                # Only use token1 orderbook to maintain canonical fair
+                book1 = md.books.get(t1)
+                if not book1:
+                    continue
+                bb1 = book1.best_bid()
+                ba1 = book1.best_ask()
+                if bb1 is None and ba1 is None:
+                    continue
+                if bb1 is not None and ba1 is not None:
+                    mid1 = (float(bb1) + float(ba1)) / 2.0
+                    if bb1 > ba1:
+                        low, high = float(ba1), float(bb1)
+                        mid1 = min(max(mid1, low), high)
+                elif bb1 is not None:
+                    mid1 = float(bb1)
+                else:
+                    mid1 = float(ba1)
+                mid1 = float(min(0.99, max(0.01, mid1)))
+                # Token2 mid
+                mid2 = float(min(0.99, max(0.01, 1.0 - mid1)))
+                last_fair_seen[t1] = mid1
+                last_fair_seen[t2] = mid2
             await asyncio.sleep(1.0)
     finally:
         halt_event.set()

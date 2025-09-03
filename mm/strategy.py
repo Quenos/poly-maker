@@ -50,13 +50,18 @@ class AvellanedaLite:
             self.vol_ewma = 0.2 * inst + 0.8 * self.vol_ewma
         return float(self.vol_ewma)
 
-    def compute_quote(self, book: OrderBook, inventory_norm: float) -> Optional[Quote]:
-        micro = book.microprice()
-        if micro is None:
-            return None
-        fair = self.fair_ewma.update(micro)
-        mid = book.mid() or fair
-        sigma = self._update_vol(mid)
+    def compute_quote(self, book: OrderBook, inventory_norm: float, fair_hint: Optional[float] = None) -> Optional[Quote]:
+        # Use provided fair_hint (token1-based or mirrored) when available; else fall back to book microprice
+        if fair_hint is not None:
+            fair = self.fair_ewma.update(fair_hint)
+            mid_for_vol = fair
+        else:
+            micro = book.microprice()
+            if micro is None:
+                return None
+            fair = self.fair_ewma.update(micro)
+            mid_for_vol = fair
+        sigma = self._update_vol(mid_for_vol)
         h = self.k_vol * sigma + self.k_fee_ticks * 0.01
         delta_r = -self.inv_gamma * inventory_norm
         bid = max(0.01, min(0.99, fair + delta_r - h))
@@ -245,4 +250,3 @@ class AdvancedAvellanedaStrategy:
             no_ask = min(0.99, mid_no + state.tick)
 
         return QuotesOut(yes_bid=yes_bid, yes_ask=yes_ask, no_bid=no_bid, no_ask=no_ask, size_multiplier=size_mult)
-
