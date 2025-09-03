@@ -357,6 +357,50 @@ def _fetch_assets_metadata(
     return token_to_market_name, token_to_outcome, token_to_market_id
 
 
+def _fetch_conditions_questions_gamma(condition_ids: List[str]) -> Dict[str, str]:
+    """Fetch condition questions by condition ids using Gamma API.
+
+    Returns a mapping of condition_id -> question/title/name.
+    """
+    headers = {
+        "User-Agent": "poly-maker-dashboard/1.0",
+        "Accept": "application/json",
+    }
+    gamma_base_url = "https://gamma-api.polymarket.com"
+    market_to_name: Dict[str, str] = {}
+    if not condition_ids:
+        return market_to_name
+    batch_size = 20
+    for i in range(0, len(condition_ids), batch_size):
+        batch = [str(x) for x in condition_ids[i:i + batch_size] if x]
+        ids_param = ",".join(batch)
+        try:
+            url = f"{gamma_base_url}/conditions?ids={ids_param}"
+            logger.info(f"Fetching Gamma conditions batch {i//batch_size + 1}: {url}")
+            resp = requests.get(url, headers=headers, timeout=15)
+            if not resp.ok:
+                logger.warning(f"Gamma conditions request failed: {resp.status_code}")
+                continue
+            data = resp.json()
+            items: List[Dict[str, Any]] = (
+                data if isinstance(data, list) else data.get("conditions", []) if isinstance(data, dict) else []
+            )
+            for item in items:
+                try:
+                    cid = str(item.get("id") or item.get("conditionId") or "")
+                    if not cid:
+                        continue
+                    name = item.get("question") or item.get("title") or item.get("name")
+                    if name:
+                        market_to_name[cid] = str(name)
+                except Exception:
+                    continue
+        except Exception as exc:
+            logger.warning(f"Gamma conditions batch error: {exc}")
+            continue
+    return market_to_name
+
+
 @app.get("/", include_in_schema=False)
 def index() -> FileResponse:
     index_path = os.path.join(STATIC_DIR, "index.html")
@@ -480,11 +524,35 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
         # Log the columns we have to debug
         logger.info(f"Order columns: {list(orders_df.columns)}")
         
-        # 0) Use existing title column if available (most reliable)
+        # 0) Primary: resolve market names via Gamma markets/{id} using 'market' (condition_id)
+        if "market" in orders_df.columns and orders_df["market"].notna().any():
+            unique_mids = sorted(set(orders_df["market"].dropna().astype(str)))
+            logger.info(f"Resolving market names via Gamma markets/{{id}} for {len(unique_mids)} markets")
+            m2n_primary: Dict[str, str] = {}
+            headers = {"User-Agent": "poly-maker-dashboard/1.0", "Accept": "application/json"}
+            gamma_base_url = "https://gamma-api.polymarket.com"
+            for mid in unique_mids:
+                try:
+                    resp = requests.get(f"{gamma_base_url}/markets/{mid}", headers=headers, timeout=10)
+                    if not resp.ok:
+                        continue
+                    data = resp.json()
+                    name = data.get("question") or data.get("title") or data.get("name")
+                    if name:
+                        m2n_primary[str(mid)] = str(name)
+                except Exception:
+                    continue
+            if m2n_primary:
+                orders_df["market_name"] = orders_df["market"].astype(str).map(m2n_primary).fillna(orders_df["market_name"])
+                logger.info(f"Mapped {len(m2n_primary)} market names from Gamma markets/{{id}} (primary)")
+        
+        # 1) Use existing title column to fill any still-empty names
         if "title" in orders_df.columns and orders_df["title"].notna().any():
-            logger.info("Found title column, using it for market names")
-            orders_df["market_name"] = orders_df["title"].fillna("")
-            logger.info(f"Set {orders_df['title'].notna().sum()} market names from title column")
+            logger.info("Filling remaining market names using title column")
+            mask_title = orders_df["market_name"].eq("") & orders_df["title"].notna()
+            if mask_title.any():
+                orders_df.loc[mask_title, "market_name"] = orders_df.loc[mask_title, "title"].astype(str)
+                logger.info(f"Filled {int(mask_title.sum())} market names from title column")
         
         # 1) Assets API by token IDs - this is the secondary method
         # Look for asset column with different possible names (match positions order)
@@ -547,10 +615,44 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
         # Positions path has no extra ad-hoc token fallback; keep logic aligned
         # No Google Sheets fallback; rely on Gamma/data APIs only
         
+        # 3b) Per-market fetch using Gamma markets/{id} for any still-missing names
+        if "market_name" in orders_df.columns and orders_df["market_name"].eq("").any() and "market" in orders_df.columns:
+            missing_mids = sorted(set(orders_df.loc[orders_df["market_name"].eq("") & orders_df["market"].notna(), "market"].astype(str)))
+            if missing_mids:
+                logger.info(f"Fetching questions for {len(missing_mids)} markets via Gamma markets/{{id}} endpoint")
+                m2n_per: Dict[str, str] = {}
+                headers = {"User-Agent": "poly-maker-dashboard/1.0", "Accept": "application/json"}
+                gamma_base_url = "https://gamma-api.polymarket.com"
+                for mid in missing_mids:
+                    try:
+                        resp = requests.get(f"{gamma_base_url}/markets/{mid}", headers=headers, timeout=10)
+                        if not resp.ok:
+                            continue
+                        data = resp.json()
+                        name = data.get("question") or data.get("title") or data.get("name")
+                        if name:
+                            m2n_per[str(mid)] = str(name)
+                    except Exception:
+                        continue
+                if m2n_per:
+                    mask = orders_df["market_name"].eq("") & orders_df["market"].notna()
+                    orders_df.loc[mask, "market_name"] = orders_df.loc[mask, "market"].astype(str).map(m2n_per).fillna("")
+                    logger.info(f"Updated {len(m2n_per)} market names from Gamma markets/{{id}} endpoint")
+
+        # Final fallback: show market id when name is still empty
+        if "market" in orders_df.columns and orders_df["market_name"].eq("").any():
+            mask = orders_df["market_name"].eq("") & orders_df["market"].notna()
+            if mask.any():
+                orders_df.loc[mask, "market_name"] = orders_df.loc[mask, "market"].astype(str)
+                logger.info(f"Filled {int(mask.sum())} market names with market id as fallback")
+
+        # Log non-empty stats (not just non-null)
         total_orders = len(orders_df)
-        orders_with_names = orders_df["market_name"].notna().sum()
-        orders_with_outcomes = orders_df["outcome"].notna().sum()
-        logger.info(f"Final enrichment results: {orders_with_names}/{total_orders} orders have market names, {orders_with_outcomes}/{total_orders} have outcomes")
+        orders_with_names = int(orders_df["market_name"].astype(str).str.strip().ne("").sum())
+        orders_with_outcomes = int(orders_df["outcome"].astype(str).str.strip().ne("").sum())
+        logger.info(
+            f"Final enrichment results: {orders_with_names}/{total_orders} orders have market names, {orders_with_outcomes}/{total_orders} have outcomes"
+        )
         
         # Log which tokens still don't have market names for debugging
         if asset_col and orders_with_names < total_orders:
