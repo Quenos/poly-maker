@@ -470,6 +470,7 @@ cython_debug/
 
 # unrelated
 docs/notes.md
+docs/mm-refactor-plan.md
 
 # Database files
 *.db

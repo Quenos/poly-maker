@@ -1,14 +1,13 @@
 import asyncio
 import argparse
 import logging
+from logging.handlers import TimedRotatingFileHandler
 from typing import Dict, List
 import time
 import os
 import glob
-from datetime import datetime
 import signal
 
-import pandas as pd
 import requests
 
 from mm.config import load_config
@@ -20,19 +19,14 @@ from mm.strategy import AvellanedaLite, build_layered_quotes
 from mm.risk import RiskManager
 from mm.selection import SelectionManager
 from mm.merge_manager import MergeManager, MergeConfig
-from store_selected_markets import read_sheet
-from poly_utils.google_utils import get_spreadsheet
-
 
 logger = logging.getLogger("mm")
-
 
 def _to_float(x) -> float:
     try:
         return float(x)
     except Exception:
         return 0.0
-
 
 def _fetch_positions_by_token(address: str) -> Dict[str, float]:
     """Fetch current positions via Data-API and return token_id -> shares (float)."""
@@ -57,8 +51,7 @@ def _fetch_positions_by_token(address: str) -> Dict[str, float]:
     except Exception:
         logger.exception("Failed to fetch positions for %s", address)
     return out
-
-
+ 
 def _fetch_nav_usd(address: str) -> float:
     try:
         url = f"https://data-api.polymarket.com/value?user={address}"
@@ -79,90 +72,6 @@ def _fetch_nav_usd(address: str) -> float:
     except Exception:
         logger.exception("Failed to fetch NAV for %s", address)
         return 0.0
-
-
-def normalize_selected_markets(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Normalize columns from Selected Markets without filtering.
-    """
-    df = df.copy()
-    col_map = {
-        "Liquidity": "liquidity",
-        "Volume_24h": "volume24h",
-        "Volume_7d": "volume7d",
-        "Volume_30d": "volume30d",
-        "market_id": "market_id",
-        "yes_token_id": "yes_token_id",
-        "no_token_id": "no_token_id",
-        "token1": "token1",
-        "token2": "token2",
-        "condition_id": "condition_id",
-    }
-    for src, dst in col_map.items():
-        if src in df.columns:
-            df[dst] = df[src]
-    for c in ["liquidity", "volume24h", "volume7d", "volume30d"]:
-        series = df[c] if c in df.columns else pd.Series([0.0] * len(df), index=df.index)
-        df[c] = pd.to_numeric(series, errors="coerce").fillna(0.0)
-    # Ensure token/ids are strings
-    for c in ["token1", "token2", "yes_token_id", "no_token_id", "condition_id"]:
-        if c in df.columns:
-            df[c] = df[c].astype(str)
-    return df.reset_index(drop=True)
-
-
-def enrich_gamma(df: pd.DataFrame, gamma_base: str) -> pd.DataFrame:
-    if df.empty:
-        return df
-    try:
-        # Build targeted list of clob token ids strictly from token1/token2
-        token_ids: List[str] = []
-        for col in ("token1", "token2"):
-            if col in df.columns:
-                token_ids.extend([str(x) for x in df[col].dropna().astype(str).tolist() if str(x)])
-        token_ids = list(dict.fromkeys(token_ids))
-        if not token_ids:
-            # No ids available; return unchanged (no fallback)
-            return df
-
-        # Query Gamma in chunks using clob_token_ids filter
-        def _chunks(lst: List[str], n: int) -> List[List[str]]:
-            return [lst[i:i + n] for i in range(0, len(lst), n)]
-
-        items: List[dict] = []
-        for chunk in _chunks(token_ids, 200):
-            params = "&".join([f"clob_token_ids={requests.utils.quote(t)}" for t in chunk])
-            url = f"{gamma_base}/markets?{params}"
-            resp = requests.get(url, timeout=20)
-            resp.raise_for_status()
-            batch = resp.json() or []
-            if batch:
-                items.extend(batch)
-        gdf = pd.DataFrame(items)
-        if gdf.empty:
-            return df
-
-        # Join back to original by token id
-        left = df.copy()
-        # Join strictly on token1
-        left_key = "token1"
-        if left_key not in left.columns:
-            return df
-        left[left_key] = left[left_key].astype(str)
-
-        # Gamma clobTokenIds may be list or comma-separated; derive first token as yes side proxy
-        def _first_token(x) -> str:
-            if isinstance(x, list) and x:
-                return str(x[0])
-            if isinstance(x, str) and x:
-                return x.split(",")[0].strip()
-            return ""
-
-        gdf[left_key] = gdf.get("clobTokenIds", "").map(_first_token)
-        merged = left.merge(gdf, on=left_key, how="left", suffixes=("", "_g"))
-        return merged
-    except Exception:
-        return df
 
 
 def _cleanup_old_logs(prefix: str, keep_count: int = 5) -> None:
@@ -186,30 +95,23 @@ def _cleanup_old_logs(prefix: str, keep_count: int = 5) -> None:
         logger.warning("Failed to cleanup old logs: %s", e)
 
 
-async def main_async(test_mode: bool = False) -> None:
+async def main_async(test_mode: bool = False, debug_logging: bool = False) -> None:
     # Logging setup
-    log_level = logging.DEBUG if test_mode else logging.DEBUG
-    logging.getLogger("mm.market_data").setLevel(logging.DEBUG)
+    effective_debug = bool(debug_logging or test_mode)
+    log_level = logging.DEBUG if effective_debug else logging.INFO
+    logging.getLogger("mm.market_data").setLevel(logging.DEBUG if effective_debug else logging.INFO)
     log_handlers: list[logging.Handler] = [logging.StreamHandler()]
-    
-    # Always create logs directory and add file handler
+
+    # Always create logs directory and add timed rotating file handler
     os.makedirs("logs", exist_ok=True)
-    
-    # Create timestamp for log filename
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_filename = f"logs/mm_main_{ts}.log"
-    
-    # Clear old main log files (keep only the most recent 5)
-    _cleanup_old_logs("mm_main_")
-    
-    # Create file handler and add to handlers
-    fh = logging.FileHandler(log_filename)
+    file_path = "logs/mm_main.log"
+    fh = TimedRotatingFileHandler(file_path, when="midnight", backupCount=5, encoding="utf-8")
     log_handlers.append(fh)
-    
+
     logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s", handlers=log_handlers)
-    
+
     # Log that file logging has started
-    logger.info("Logging to file: %s", log_filename)
+    logger.info("Logging to rotating file: %s (daily, keep 5 backups)", file_path)
     # Suppress noisy third-party logs; keep our package logs
     logging.getLogger("websockets").setLevel(logging.WARNING)
     logging.getLogger("websockets.client").setLevel(logging.WARNING)
@@ -223,21 +125,17 @@ async def main_async(test_mode: bool = False) -> None:
         daily_loss_limit_pct=cfg.daily_loss_limit_pct,
     )
 
-    # Read Selected Markets
-    ss = get_spreadsheet(read_only=False)
-    selected = read_sheet(ss, cfg.selected_sheet_name)
-    if selected.empty:
+    # Initial selection via SelectionManager (single source of truth)
+    sel = SelectionManager(cfg.gamma_base_url, state_store=state, sheet_name=cfg.selected_sheet_name)
+    initial_tokens, enriched = await asyncio.to_thread(sel.pull)
+    logger.info("🎯 Initial market selection: %d markets loaded from sheet", len(initial_tokens))
+    if initial_tokens:
+        logger.info("Initial markets: %s", initial_tokens[:5])
+        if len(initial_tokens) > 5:
+            logger.info("... and %d more markets", len(initial_tokens) - 5)
+    if len(initial_tokens) == 0:
         logger.info("Selected Markets empty; exiting")
         return
-
-    # Normalize (no filtering in the MM daemon)
-    normalized = normalize_selected_markets(selected)
-    if normalized.empty:
-        logger.info("Selected Markets had no rows; exiting")
-        return
-
-    # Enrich via Gamma
-    enriched = enrich_gamma(normalized, cfg.gamma_base_url)
 
     # Build token->market mapping (use condition_id or Gamma conditionId)
     token_to_market: Dict[str, str] = {}
@@ -264,11 +162,7 @@ async def main_async(test_mode: bool = False) -> None:
                 token_pairs.append((t1, t2))
 
     # Build token id list strictly from token1/token2
-    token_ids: List[str] = []
-    for col in ("token1", "token2"):
-        if col in enriched.columns:
-            token_ids.extend([str(x) for x in enriched[col].dropna().astype(str).tolist() if str(x)])
-    token_ids = list(dict.fromkeys(token_ids))
+    token_ids: List[str] = list(initial_tokens)
 
     # Market data
     md = MarketData(cfg.clob_ws_url, cfg.clob_base_url)
@@ -340,23 +234,14 @@ async def main_async(test_mode: bool = False) -> None:
     cooldown_until: Dict[str, float] = {}
     _last_heartbeat: float = 0.0
 
-    # Selection supervisor (15 min re-pull)
-    sel = SelectionManager(cfg.gamma_base_url, state_store=state)
-    
-    # Log initial market selection
-    initial_tokens, _ = sel.pull()
-    logger.info("🎯 Initial market selection: %d markets loaded from sheet", len(initial_tokens))
-    if initial_tokens:
-        logger.info("Initial markets: %s", initial_tokens[:5])  # Show first 5 for brevity
-        if len(initial_tokens) > 5:
-            logger.info("... and %d more markets", len(initial_tokens) - 5)
+    # Selection supervisor (15 min re-pull) handled by existing SelectionManager instance
 
     async def selection_loop() -> None:
         nonlocal token_ids, token_to_market, token_to_token1, token_pairs, strategies
         logger.info("Selection loop started - checking for market changes every 15 minutes")
         while not halt_event.is_set():
             try:
-                to_add, to_remove = sel.tick()
+                to_add, to_remove = await asyncio.to_thread(sel.tick)
                 if to_add or to_remove:
                     logger.info("🔄 MARKET SELECTION CHANGE DETECTED - Updating trading configuration")
                     logger.info("Previous active markets: %d", len(token_ids))
@@ -374,7 +259,7 @@ async def main_async(test_mode: bool = False) -> None:
                     logger.info("New active markets: %d", len(token_ids))
                     
                     # Re-enrich to capture latest condition ids
-                    _, enr = sel.pull()
+                    _, enr = await asyncio.to_thread(sel.pull)
                     old_market_count = len(token_to_market)
                     token_to_market.clear()
                     token_to_token1.clear()
@@ -486,8 +371,14 @@ async def main_async(test_mode: bool = False) -> None:
         while True:
             # Pull live positions and NAV for inventory-aware quoting
             wallet = os.getenv("BROWSER_ADDRESS", "")
-            positions_by_token = _fetch_positions_by_token(wallet) if wallet else {}
-            nav_usd = _fetch_nav_usd(wallet) if wallet else 0.0
+            if wallet:
+                positions_by_token, nav_usd = await asyncio.gather(
+                    asyncio.to_thread(_fetch_positions_by_token, wallet),
+                    asyncio.to_thread(_fetch_nav_usd, wallet),
+                )
+            else:
+                positions_by_token = {}
+                nav_usd = 0.0
 
             # Heartbeat every 5s to confirm loop is alive
             try:
@@ -733,8 +624,9 @@ async def main_async(test_mode: bool = False) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Polymarket Market-Making Daemon")
     parser.add_argument("--test", action="store_true", help="Dry run: no orders sent, debug logs to file")
+    parser.add_argument("--debug", action="store_true", help="Enable DEBUG logging without enabling dry-run")
     args = parser.parse_args()
-    asyncio.run(main_async(test_mode=bool(args.test)))
+    asyncio.run(main_async(test_mode=bool(args.test), debug_logging=bool(args.debug)))
 
 
 if __name__ == "__main__":

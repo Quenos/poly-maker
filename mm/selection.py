@@ -3,6 +3,7 @@ import logging
 from typing import List, Tuple, Optional
 
 import pandas as pd
+import requests
 
 from store_selected_markets import read_sheet
 from poly_utils.google_utils import get_spreadsheet
@@ -13,30 +14,102 @@ logger = logging.getLogger("mm.selection")
 
 
 def normalize_selected_markets(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Normalize columns from Selected Markets without filtering.
+    """
     df = df.copy()
-    for c in ["token1", "token2", "condition_id"]:
+    col_map = {
+        "Liquidity": "liquidity",
+        "Volume_24h": "volume24h",
+        "Volume_7d": "volume7d",
+        "Volume_30d": "volume30d",
+        "market_id": "market_id",
+        "yes_token_id": "yes_token_id",
+        "no_token_id": "no_token_id",
+        "token1": "token1",
+        "token2": "token2",
+        "condition_id": "condition_id",
+    }
+    for src, dst in col_map.items():
+        if src in df.columns:
+            df[dst] = df[src]
+    for c in ["liquidity", "volume24h", "volume7d", "volume30d"]:
+        series = df[c] if c in df.columns else pd.Series([0.0] * len(df), index=df.index)
+        df[c] = pd.to_numeric(series, errors="coerce").fillna(0.0)
+    # Ensure token/ids are strings
+    for c in ["token1", "token2", "yes_token_id", "no_token_id", "condition_id"]:
         if c in df.columns:
             df[c] = df[c].astype(str)
     return df.reset_index(drop=True)
 
 
 def enrich_gamma(df: pd.DataFrame, gamma_base: str) -> pd.DataFrame:
-    # Placeholder: tests patch this; default behavior is passthrough
-    return df
+    if df.empty:
+        return df
+    try:
+        # Build targeted list of clob token ids strictly from token1/token2
+        token_ids: List[str] = []
+        for col in ("token1", "token2"):
+            if col in df.columns:
+                token_ids.extend([str(x) for x in df[col].dropna().astype(str).tolist() if str(x)])
+        token_ids = list(dict.fromkeys(token_ids))
+        if not token_ids:
+            # No ids available; return unchanged (no fallback)
+            return df
+
+        # Query Gamma in chunks using clob_token_ids filter
+        def _chunks(lst: List[str], n: int) -> List[List[str]]:
+            return [lst[i:i + n] for i in range(0, len(lst), n)]
+
+        items: List[dict] = []
+        for chunk in _chunks(token_ids, 200):
+            params = "&".join([f"clob_token_ids={requests.utils.quote(t)}" for t in chunk])
+            url = f"{gamma_base}/markets?{params}"
+            resp = requests.get(url, timeout=20)
+            resp.raise_for_status()
+            batch = resp.json() or []
+            if batch:
+                items.extend(batch)
+        gdf = pd.DataFrame(items)
+        if gdf.empty:
+            return df
+
+        # Join back to original by token id
+        left = df.copy()
+        # Join strictly on token1
+        left_key = "token1"
+        if left_key not in left.columns:
+            return df
+        left[left_key] = left[left_key].astype(str)
+
+        # Gamma clobTokenIds may be list or comma-separated; derive first token as yes side proxy
+        def _first_token(x) -> str:
+            if isinstance(x, list) and x:
+                return str(x[0])
+            if isinstance(x, str) and x:
+                return x.split(",")[0].strip()
+            return ""
+
+        gdf[left_key] = gdf.get("clobTokenIds", "").map(_first_token)
+        merged = left.merge(gdf, on=left_key, how="left", suffixes=("", "_g"))
+        return merged
+    except Exception:
+        return df
 
 
 class SelectionManager:
-    def __init__(self, gamma_base: str, state_store: Optional[StateStore] = None) -> None:
+    def __init__(self, gamma_base: str, state_store: Optional[StateStore] = None, sheet_name: str = "Selected Markets") -> None:
         self.gamma_base = gamma_base
         self.active_tokens: List[str] = []
         self.version: int = 0
         self.ts: float = 0.0
         self.state = state_store
-        logger.info("SelectionManager initialized with gamma_base=%s", gamma_base)
+        self.sheet_name = sheet_name
+        logger.info("SelectionManager initialized with gamma_base=%s sheet=%s", gamma_base, sheet_name)
 
     def pull(self) -> Tuple[List[str], pd.DataFrame]:
         ss = get_spreadsheet(read_only=False)
-        sel = read_sheet(ss, "Selected Markets")
+        sel = read_sheet(ss, self.sheet_name)
         norm = normalize_selected_markets(sel)
         # Recompute screening metrics (Trend, MM_SCORE), but we still trade exactly Selected Markets
 

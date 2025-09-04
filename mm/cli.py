@@ -1,20 +1,34 @@
 import argparse
+import logging
 from mm.state import StateStore
+
+
+logger = logging.getLogger("mm.cli")
 
 
 def export_pnl(date: str) -> None:
     st = StateStore()
     realized, unrealized, fees, rebates = st.export_pnl_for_date(date)
-    print(f"date={date} realized={realized:.2f} unrealized={unrealized:.2f} fees={fees:.2f} rebates={rebates:.2f}")
+    logger.info(
+        "date=%s realized=%.2f unrealized=%.2f fees=%.2f rebates=%.2f",
+        date,
+        realized,
+        unrealized,
+        fees,
+        rebates,
+    )
 
 
 def rebuild_positions() -> None:
     st = StateStore()
     st.rebuild_positions_from_fills()
-    print("Positions rebuilt from fills.")
+    logger.info("Positions rebuilt from fills.")
 
 
 def main() -> None:
+    # Ensure basic logging for CLI runs if not already configured
+    if not logging.getLogger().handlers:
+        logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     parser = argparse.ArgumentParser(description="MM CLI")
     sub = parser.add_subparsers(dest="cmd")
 
