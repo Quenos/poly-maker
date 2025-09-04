@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Position Closing Test</title>
+    <link rel="stylesheet" href="styles.css" />
+  </head>
+  <body>
+    <div class="container">
+      <div class="header-row">
+        <h1>Position Closing Test</h1>
+      </div>
+
+      <section>
+        <h2>Positions (Test Data)</h2>
+        <div class="positions-header">
+          <button id="close-all-btn" class="btn btn-danger">Close All Positions</button>
+        </div>
+        <table id="positions">
+          <thead>
+            <tr>
+              <th>Market</th>
+              <th>Outcome</th>
+              <th>Size</th>
+              <th>Avg Price</th>
+              <th>Cur Price</th>
+              <th>PnL %</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody id="positions-tbody"></tbody>
+        </table>
+      </section>
+
+      <div id="debug-info" style="margin-top: 20px; padding: 10px; background: #1e2632; border-radius: 4px;">
+        <h3>Debug Info</h3>
+        <div id="debug-content"></div>
+      </div>
+    </div>
+
+    <script>
+      // Mock positions data for testing
+      const mockPositions = [
+        {
+          market_name: "Will Bitcoin reach $100k in 2024?",
+          outcome: "Yes",
+          size: 100,
+          avgPrice: 0.65,
+          curPrice: 0.72,
+          percentPnl: 10.8,
+          asset: "0x1234567890abcdef1234567890abcdef12345678"
+        },
+        {
+          market_name: "Ethereum merge success",
+          outcome: "No",
+          size: -50,
+          avgPrice: 0.45,
+          curPrice: 0.38,
+          percentPnl: -15.6,
+          asset: "0xabcdef1234567890abcdef1234567890abcdef12"
+        },
+        {
+          market_name: "Tesla stock performance",
+          outcome: "Above $300",
+          size: 75,
+          avgPrice: 0.55,
+          curPrice: 0.48,
+          percentPnl: -12.7,
+          asset: "0x9876543210fedcba9876543210fedcba98765432"
+        }
+      ];
+
+      function setRows(tbody, rows, columns) {
+        tbody.innerHTML = '';
+        console.log('setRows called for:', tbody.id, 'with', rows.length, 'rows');
+        
+        for (const row of rows) {
+          const tr = document.createElement('tr');
+          for (const c of columns) {
+            const td = document.createElement('td');
+            let v = row[c];
+            if (typeof v === 'number') {
+              v = Math.abs(v) > 1e6 ? v.toFixed(2) : v;
+            }
+            td.textContent = v == null ? '' : v;
+            tr.appendChild(td);
+          }
+          
+          // Add actions column for positions table
+          if (tbody.id === 'positions-tbody') {
+            console.log('Processing position row:', row);
+            
+            // Try to find the asset/token ID from various possible field names
+            const assetId = row.asset || row.token_id || row.tokenId || row.asset_id;
+            
+            if (assetId) {
+              console.log('Found asset ID:', assetId);
+              const actionsTd = document.createElement('td');
+              actionsTd.className = 'actions-cell';
+              
+              // Create price input
+              const priceInput = document.createElement('input');
+              priceInput.type = 'number';
+              priceInput.step = '0.01';
+              priceInput.min = '0.01';
+              priceInput.max = '0.99';
+              priceInput.placeholder = '0.01-0.99';
+              priceInput.className = 'price-input';
+              
+              // Create close at limit button
+              const closeLimitBtn = document.createElement('button');
+              closeLimitBtn.textContent = 'Close at Limit';
+              closeLimitBtn.className = 'btn btn-primary btn-sm';
+              closeLimitBtn.onclick = () => closePosition(assetId, parseFloat(priceInput.value));
+              
+              // Create close at market button
+              const closeMarketBtn = document.createElement('button');
+              closeMarketBtn.textContent = 'Close at Market';
+              closeMarketBtn.className = 'btn btn-warning btn-sm';
+              closeMarketBtn.onclick = () => closePosition(assetId, null);
+              
+              actionsTd.appendChild(priceInput);
+              actionsTd.appendChild(closeLimitBtn);
+              actionsTd.appendChild(closeMarketBtn);
+              tr.appendChild(actionsTd);
+            } else {
+              console.log('No asset ID found in row:', Object.keys(row));
+              // Add empty actions cell for consistency
+              const actionsTd = document.createElement('td');
+              actionsTd.textContent = 'No asset ID';
+              actionsTd.className = 'actions-cell';
+              tr.appendChild(actionsTd);
+            }
+          }
+          
+          tbody.appendChild(tr);
+        }
+      }
+
+      // Function to close a specific position (mock version)
+      async function closePosition(tokenId, price) {
+        const message = price !== null && !isNaN(price) 
+          ? `Closing position ${tokenId} at limit price ${price}`
+          : `Closing position ${tokenId} at market`;
+        
+        console.log(message);
+        alert(`Mock: ${message}`);
+        
+        // Update debug info
+        updateDebugInfo(`Position close requested: ${message}`);
+      }
+
+      // Function to close all positions (mock version)
+      async function closeAllPositions() {
+        if (!confirm('Are you sure you want to close ALL positions? This will submit aggressive market orders.')) {
+          return;
+        }
+        
+        console.log('Closing all positions');
+        alert('Mock: Closing all positions with aggressive defaults');
+        
+        // Update debug info
+        updateDebugInfo('All positions close requested');
+      }
+
+      function updateDebugInfo(message) {
+        const debugContent = document.getElementById('debug-content');
+        const timestamp = new Date().toLocaleTimeString();
+        debugContent.innerHTML += `<div>[${timestamp}] ${message}</div>`;
+      }
+
+      // Initialize the test page
+      document.addEventListener('DOMContentLoaded', () => {
+        // Setup event listener for close all button
+        document.getElementById('close-all-btn').addEventListener('click', closeAllPositions);
+        
+        // Load mock positions
+        setRows(
+          document.getElementById('positions-tbody'),
+          mockPositions,
+          ['market_name', 'outcome', 'size', 'avgPrice', 'curPrice', 'percentPnl']
+        );
+        
+        updateDebugInfo('Test page loaded with mock positions');
+        console.log('Test page initialized');
+      });
+    </script>
+  </body>
+</html>
