@@ -34,11 +34,23 @@ tbody tr:hover { background: #0f141b; }
 .actions-cell { white-space: nowrap; }
 .actions-cell > * { margin-right: 6px; }
 .actions-cell > *:last-child { margin-right: 0; }
-.price-input { width: 70px; padding: 4px 6px; border: 1px solid #2b3240; background: #1e2632; color: #e6e6e6; border-radius: 4px; font-size: 11px; }
+.price-input { width: 80px; padding: 6px 8px; border: 1px solid #2b3240; background: #0f1520; color: #e6e6e6; border-radius: 8px; font-size: 12px; transition: border-color 0.15s ease, box-shadow 0.15s ease; }
+.price-input::placeholder { color: #94a3b8; }
+/* Remove number spinners */
+.price-input::-webkit-outer-spin-button,
+.price-input::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+.price-input { -moz-appearance: textfield; }
 
 /* Improved actions layout and states */
-.price-input:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59,130,246,0.2); }
-.action-group { display: inline-flex; align-items: center; gap: 6px; }
+.price-input:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 3px rgba(59,130,246,0.18); }
+.action-group { display: inline-flex; align-items: center; gap: 8px; }
 .btn.btn-pill { border-radius: 999px; }
 .btn[disabled] { opacity: 0.6; cursor: not-allowed; }
+
+/* Subtle surface for actions cell */
+.actions-cell { white-space: nowrap; }
+.actions-cell .action-group { background: #121826; padding: 6px 8px; border: 1px solid #1f2836; border-radius: 10px; }
+
+/* Icon sizing inside buttons */
+.btn svg { width: 12px; height: 12px; fill: currentColor; }
 

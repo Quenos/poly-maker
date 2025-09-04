@@ -35,7 +35,10 @@
       <section>
         <h2>Positions</h2>
         <div class="positions-header">
-          <button id="close-all-btn" class="btn btn-pill btn-danger">Close All Positions</button>
+          <button id="close-all-btn" class="btn btn-pill btn-danger" title="Submit aggressive orders to close all positions">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h14m0 0l-4-4m4 4l-4 4"/></svg>
+            Close All Positions
+          </button>
         </div>
         <table id="positions">
           <thead>
@@ -119,14 +122,14 @@
               
               // Create close at limit button
               const closeLimitBtn = document.createElement('button');
-              closeLimitBtn.textContent = 'Limit';
               closeLimitBtn.className = 'btn btn-pill btn-primary btn-sm';
+              closeLimitBtn.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h16M4 6h16M4 18h10"/></svg><span>Limit</span>';
               closeLimitBtn.onclick = () => closePosition(assetId, parseFloat(priceInput.value), [closeLimitBtn, closeMarketBtn]);
               
               // Create close at market button
               const closeMarketBtn = document.createElement('button');
-              closeMarketBtn.textContent = 'Market';
               closeMarketBtn.className = 'btn btn-pill btn-warning btn-sm';
+              closeMarketBtn.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12l4 4L19 6"/></svg><span>Market</span>';
               closeMarketBtn.onclick = () => closePosition(assetId, null, [closeLimitBtn, closeMarketBtn]);
               
               group.appendChild(priceInput);
