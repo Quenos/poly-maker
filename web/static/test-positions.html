@@ -89,15 +89,15 @@
           
           // Add actions column for positions table
           if (tbody.id === 'positions-tbody') {
-            console.log('Processing position row:', row);
-            
             // Try to find the asset/token ID from various possible field names
             const assetId = row.asset || row.token_id || row.tokenId || row.asset_id;
             
             if (assetId) {
-              console.log('Found asset ID:', assetId);
               const actionsTd = document.createElement('td');
               actionsTd.className = 'actions-cell';
+              
+              const group = document.createElement('div');
+              group.className = 'action-group';
               
               // Create price input
               const priceInput = document.createElement('input');
@@ -105,27 +105,28 @@
               priceInput.step = '0.01';
               priceInput.min = '0.01';
               priceInput.max = '0.99';
-              priceInput.placeholder = '0.01-0.99';
+              priceInput.placeholder = 'Limit';
+              priceInput.title = 'Limit price (0.01-0.99)';
               priceInput.className = 'price-input';
               
               // Create close at limit button
               const closeLimitBtn = document.createElement('button');
-              closeLimitBtn.textContent = 'Close at Limit';
-              closeLimitBtn.className = 'btn btn-primary btn-sm';
-              closeLimitBtn.onclick = () => closePosition(assetId, parseFloat(priceInput.value));
+              closeLimitBtn.textContent = 'Limit';
+              closeLimitBtn.className = 'btn btn-pill btn-primary btn-sm';
+              closeLimitBtn.onclick = () => closePosition(assetId, parseFloat(priceInput.value), [closeLimitBtn, closeMarketBtn]);
               
               // Create close at market button
               const closeMarketBtn = document.createElement('button');
-              closeMarketBtn.textContent = 'Close at Market';
-              closeMarketBtn.className = 'btn btn-warning btn-sm';
-              closeMarketBtn.onclick = () => closePosition(assetId, null);
+              closeMarketBtn.textContent = 'Market';
+              closeMarketBtn.className = 'btn btn-pill btn-warning btn-sm';
+              closeMarketBtn.onclick = () => closePosition(assetId, null, [closeLimitBtn, closeMarketBtn]);
               
-              actionsTd.appendChild(priceInput);
-              actionsTd.appendChild(closeLimitBtn);
-              actionsTd.appendChild(closeMarketBtn);
+              group.appendChild(priceInput);
+              group.appendChild(closeLimitBtn);
+              group.appendChild(closeMarketBtn);
+              actionsTd.appendChild(group);
               tr.appendChild(actionsTd);
             } else {
-              console.log('No asset ID found in row:', Object.keys(row));
               // Add empty actions cell for consistency
               const actionsTd = document.createElement('td');
               actionsTd.textContent = 'No asset ID';
@@ -139,16 +140,23 @@
       }
 
       // Function to close a specific position (mock version)
-      async function closePosition(tokenId, price) {
+      async function closePosition(tokenId, price, buttons) {
         const message = price !== null && !isNaN(price) 
           ? `Closing position ${tokenId} at limit price ${price}`
           : `Closing position ${tokenId} at market`;
         
+        if (Array.isArray(buttons)) {
+          buttons.forEach(b => b && (b.disabled = true));
+        }
         console.log(message);
         alert(`Mock: ${message}`);
         
         // Update debug info
         updateDebugInfo(`Position close requested: ${message}`);
+        
+        if (Array.isArray(buttons)) {
+          buttons.forEach(b => b && (b.disabled = false));
+        }
       }
 
       // Function to close all positions (mock version)
@@ -157,11 +165,14 @@
           return;
         }
         
+        const allBtn = document.getElementById('close-all-btn');
+        if (allBtn) allBtn.disabled = true;
         console.log('Closing all positions');
         alert('Mock: Closing all positions with aggressive defaults');
         
         // Update debug info
         updateDebugInfo('All positions close requested');
+        if (allBtn) allBtn.disabled = false;
       }
 
       function updateDebugInfo(message) {

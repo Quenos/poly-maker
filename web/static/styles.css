@@ -34,3 +34,9 @@ tbody tr:hover { background: #0f141b; }
 .actions-cell > *:last-child { margin-right: 0; }
 .price-input { width: 70px; padding: 4px 6px; border: 1px solid #2b3240; background: #1e2632; color: #e6e6e6; border-radius: 4px; font-size: 11px; }
 
+/* Improved actions layout and states */
+.price-input:focus { outline: none; border-color: #3b82f6; box-shadow: 0 0 0 2px rgba(59,130,246,0.2); }
+.action-group { display: inline-flex; align-items: center; gap: 6px; }
+.btn.btn-pill { border-radius: 999px; }
+.btn[disabled] { opacity: 0.6; cursor: not-allowed; }
+
