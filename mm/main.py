@@ -470,7 +470,18 @@ async def main_async(test_mode: bool = False) -> None:
         dry_run=bool(cfg.merge_dry_run),
     )
     merge_mgr = MergeManager(merge_cfg)
-    merge_task = asyncio.create_task(merge_mgr.run_loop(os.getenv("BROWSER_ADDRESS", "")))
+    # Use configured browser address for merger (env may be unset)
+    logger.info(
+        "Launching merger loop: wallet=%s interval=%ds min=%.6f chunk=%.6f retries=%d backoff_ms=%d dry_run=%s",
+        (cfg.browser_address or ""),
+        int(cfg.merge_scan_interval_sec),
+        float(cfg.min_merge_usdc),
+        float(cfg.merge_chunk_usdc),
+        int(cfg.merge_max_retries),
+        int(cfg.merge_retry_backoff_ms),
+        str(bool(cfg.merge_dry_run)),
+    )
+    merge_task = asyncio.create_task(merge_mgr.run_loop(cfg.browser_address))
     try:
         while True:
             # Pull live positions and NAV for inventory-aware quoting

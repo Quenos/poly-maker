@@ -14,6 +14,7 @@ This module provides a production-oriented market-making daemon for Polymarket b
 - **State Persistence**: SQLite database for orders, fills, positions, and selection snapshots
 - **Prometheus Metrics**: Comprehensive monitoring and alerting
 - **Enhanced Logging**: Real-time visibility into market selection changes and system updates
+ - **On-chain Position Merging**: Automatically merges overlapping YES/NO positions based on configurable thresholds
 
 ### Prerequisites
 - Python 3.10+
@@ -202,7 +203,7 @@ python /Users/coenkuijpers/projects/poly-maker/mm/main.py
 ```bash
 python -m mm.main --test
 ```
-Test mode performs a dry run with no actual orders sent and logs to both console and `logs/mm_test_<timestamp>.log`.
+Test mode performs a dry run with no actual orders sent and logs to both console and `logs/mm_main_<timestamp>.log`.
 
 ### What It Does
 1. **Initialization**: Reads "Selected Markets" from Google Sheets
@@ -264,7 +265,7 @@ Markets REMOVED: ['old_token']
 
 #### Orders (`mm/orders.py`)
 - **OrdersClient**: Thin wrapper over py-clob-client
-- **OrdersEngine**: Advanced order lifecycle management (planned)
+- **OrdersEngine**: Advanced order lifecycle management with diffing and layered quotes
 - **Market Cancellation**: Bulk order cancellation utilities
 
 #### Selection (`mm/selection.py`)
@@ -653,6 +654,33 @@ pytest -q tests/mm/test_strategy.py
 - **File Logging**: Comprehensive logs in `logs/` directory
 - **Market Changes**: Clear visibility into selection updates
 - **Error Handling**: Detailed exception logging with context
+
+#### Configuration Reloads
+- Sending `SIGHUP` reloads configuration for in-process components but does not rebuild the merger loop. If you change merger settings, restart the daemon to apply them.
+
+### Position Merging (On-chain)
+
+The daemon runs a background merger that scans for overlapping YES/NO positions and merges them on-chain to free USDC collateral.
+
+**How it works**
+- Reads markets from the "Selected Markets" sheet and uses `token1`, `token2`, and `condition_id`.
+- Fetches wallet positions using the configured `BROWSER_ADDRESS`.
+- Computes overlap as `min(shares(token1), shares(token2))`.
+- If overlap ≥ `MIN_MERGE_USDC`, initiates merging in chunks of `MERGE_CHUNK_USDC` until the overlap is exhausted or a retry/cooldown stops the cycle.
+- For markets flagged `neg_risk` in the sheet, uses the Negative Risk Adapter; otherwise, uses the Conditional Tokens `mergePositions`.
+
+**Merger settings** (in the Settings sheet)
+- `MERGE_SCAN_INTERVAL_SEC` (int): Interval between scans (default 120)
+- `MIN_MERGE_USDC` (float): Minimum overlap in USDC (6dp shares) to trigger merging (default 0.10)
+- `MERGE_CHUNK_USDC` (float): Per-transaction merge chunk size (default 0.25)
+- `MERGE_MAX_RETRIES` (int): Max retries per market per scan (default 3)
+- `MERGE_RETRY_BACKOFF_MS` (int): Backoff between retries in milliseconds (default 500)
+- `MERGE_DRY_RUN` (bool): If true, log planned merges without sending on-chain transactions (default false)
+
+Notes
+- Overlap and thresholds are compared in "share" terms where 1.00 share equals 1 USDC (6 decimals on-chain). For example, 0.10 YES and 0.10 NO will merge.
+- The merger uses the configured `BROWSER_ADDRESS` (from .env via `sheet_config`) for position lookups and on-chain actions.
+- After changing merger settings, restart the daemon to apply changes to the merger loop.
 
 ### Future Enhancements
 

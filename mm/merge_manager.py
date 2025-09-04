@@ -36,27 +36,69 @@ def _to_bool(value) -> bool:
         return False
 
 
-def _fetch_positions_by_token(address: str) -> Dict[str, float]:
+def _fetch_positions_by_token(address: str, markets: Optional[list[str]] = None) -> Dict[str, float]:
     import requests
     out: Dict[str, float] = {}
     if not address:
         return out
     try:
-        url = f"https://data-api.polymarket.com/positions?user={address}"
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        arr = resp.json() or []
-        for row in arr:
-            token = str(row.get("token_id") or row.get("asset_id") or row.get("id") or "").strip()
-            if not token:
-                continue
-            shares = row.get("shares")
-            if shares is None:
-                shares = row.get("balance") or row.get("qty") or 0.0
-            try:
-                out[token] = float(shares)
-            except Exception:
-                out[token] = 0.0
+        base_url = "https://data-api.polymarket.com/positions"
+        params = {
+            "user": address,
+            # Include all positions regardless of size; we compute our own threshold
+            "sizeThreshold": 0,
+            # Return as many as allowed per page; paginate if needed
+            "limit": 500,
+            "offset": 0,
+            # Sort is irrelevant; use default
+        }
+        if markets:
+            # API accepts comma-separated condition IDs
+            params["market"] = ",".join([str(m) for m in markets if str(m)])
+
+        while True:
+            resp = requests.get(base_url, params=params, timeout=15)
+            resp.raise_for_status()
+            arr = resp.json() or []
+            if not isinstance(arr, list):
+                break
+            for row in arr:
+                # Prefer canonical Data API fields
+                token_field = row.get("asset")
+                if token_field is None:
+                    token_field = row.get("token_id")
+                if token_field is None:
+                    token_field = row.get("asset_id")
+                if token_field is None:
+                    token_field = row.get("id")
+                token = str(token_field or "").strip()
+                # Normalize hex token ids to decimal to match sheet values
+                if token.startswith("0x") or token.startswith("0X"):
+                    try:
+                        token = str(int(token, 16))
+                    except Exception:
+                        pass
+                if not token:
+                    continue
+                # Shares/size field
+                # Prefer 'size', then 'shares', then 'balance'/'qty'
+                if row.get("size") is not None:
+                    shares_val = row.get("size")
+                elif row.get("shares") is not None:
+                    shares_val = row.get("shares")
+                else:
+                    shares_val = row.get("balance") or row.get("qty") or 0.0
+                try:
+                    out[token] = float(shares_val)
+                except Exception:
+                    try:
+                        out[token] = float(str(shares_val))
+                    except Exception:
+                        out[token] = 0.0
+            # Pagination
+            if len(arr) < int(params["limit"]):
+                break
+            params["offset"] = int(params["offset"]) + int(params["limit"])
     except Exception:
         logger.exception("Failed to fetch positions for %s", address)
     return out
@@ -128,11 +170,21 @@ class MergeManager:
 
     async def scan_and_merge(self, wallet_address: str) -> None:
         try:
+            if not wallet_address:
+                logger.info("Merge scan: wallet address not set; skipping")
+                return
             sel = self._read_selected_markets()
             if sel.empty:
                 logger.info("Merge scan: Selected Markets empty")
                 return
-            pos_by_token = await asyncio.to_thread(_fetch_positions_by_token, wallet_address)
+            # Build list of condition ids to narrow the Data API query
+            cids: list[str] = []
+            for _, row in sel.iterrows():
+                cid_v = str(row.get("condition_id") or "").strip()
+                if cid_v:
+                    cids.append(cid_v)
+            pos_by_token = await asyncio.to_thread(_fetch_positions_by_token, wallet_address, cids)
+            logger.debug("Merge scan: fetched %d position entries for %d markets", len(pos_by_token), len(set(cids)))
             min_merge_6dp = int(self.cfg.min_merge_usdc * 1_000_000)
             chunk_6dp = int(self.cfg.merge_chunk_usdc * 1_000_000)
 
@@ -154,12 +206,26 @@ class MergeManager:
                 overlap_shares = max(0.0, min(qty1, qty2))
                 amount_6dp = int(overlap_shares * 1_000_000)
                 self.g_overlap.labels(condition_id=cid).set(amount_6dp / 1_000_000.0)
+                logger.debug(
+                    "Merge scan: cid=%s t1=%s qty1=%.6f t2=%s qty2=%.6f overlap=%.6f min=%.6f",
+                    cid, t1, qty1, t2, qty2, overlap_shares, self.cfg.min_merge_usdc,
+                )
                 if amount_6dp < min_merge_6dp:
+                    logger.debug(
+                        "Merge skip: cid=%s overlap below threshold (%.6f < %.6f)",
+                        cid,
+                        overlap_shares,
+                        self.cfg.min_merge_usdc,
+                    )
                     continue
 
                 # Chunked merge with retries and refresh after each chunk
                 merged_so_far = 0
                 retries = 0
+                logger.info(
+                    "Merge start: cid=%s neg_risk=%s planned_total=%.6f chunk=%.6f",
+                    cid, is_neg, amount_6dp / 1_000_000.0, self.cfg.merge_chunk_usdc,
+                )
                 while merged_so_far < amount_6dp:
                     to_merge = min(chunk_6dp, amount_6dp - merged_so_far)
                     attempt_amount = to_merge
