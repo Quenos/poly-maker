@@ -1020,8 +1020,8 @@ def get_pnl_trades(limit: int = 100, page: int = 1, user=Depends(require_user)) 
 
 
 @app.get("/api/orders")
-def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
-    """Return open orders using shared logic in poly_utils.open_orders.get_open_orders."""
+def get_open_orders(limit: int = 10, page: int = 1, user=Depends(require_user)) -> Dict[str, Any]:
+    """Return open orders with pagination using poly_utils.open_orders.get_open_orders."""
     try:
         from poly_utils.open_orders import get_open_orders as _get_open_orders_df  # type: ignore
     except Exception as exc:
@@ -1031,7 +1031,7 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
     try:
         df = _get_open_orders_df()
         if df is None or df.empty:
-            return {"data": []}
+            return {"data": [], "page": 1, "limit": int(limit), "total": 0}
         wanted = [
             "market_name",
             "outcome",
@@ -1042,7 +1042,18 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
             "status",
         ]
         records = _df_to_records(df, wanted)
-        return {"data": records}
+        try:
+            page_num = max(1, int(page))
+        except Exception:
+            page_num = 1
+        try:
+            limit_num = max(1, int(limit))
+        except Exception:
+            limit_num = 10
+        total = int(len(records))
+        start = (page_num - 1) * limit_num
+        end = start + limit_num
+        return {"data": records[start:end], "page": page_num, "limit": limit_num, "total": total}
     except Exception as exc:
         logger.exception("Failed to fetch open orders via poly_utils.open_orders: %s", str(exc))
         raise HTTPException(status_code=500, detail="Failed to fetch open orders")

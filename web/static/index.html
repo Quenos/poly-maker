@@ -30,6 +30,7 @@
           </thead>
           <tbody></tbody>
         </table>
+        <div class="pagination" id="orders-pagination"></div>
       </section>
 
       <section>
@@ -151,7 +152,9 @@
       }
 
       let tradePage = 1;
+      let ordersPage = 1;
       const tradesPerPage = 10;
+      const ordersPerPage = 10;
 
       function makeButton(label, page, disabled=false, active=false) {
         const btn = document.createElement('button');
@@ -197,10 +200,59 @@
         container.appendChild(makeButton('>', tradePage + 1, tradePage >= totalPages));
       }
 
+      function renderOrdersPagination(totalPages) {
+        const container = document.getElementById('orders-pagination');
+        container.innerHTML = '';
+        // Prev
+        container.appendChild((() => {
+          const btn = document.createElement('button');
+          btn.textContent = '<';
+          if (ordersPage <= 1) btn.disabled = true;
+          if (!btn.disabled) btn.addEventListener('click', () => { ordersPage = ordersPage - 1; refresh(); });
+          return btn;
+        })());
+
+        const pages = [];
+        if (totalPages <= 5) {
+          for (let p = 1; p <= totalPages; p++) pages.push(p);
+        } else {
+          pages.push(1);
+          if (ordersPage > 3) pages.push('…');
+          const start = Math.max(2, ordersPage - 1);
+          const end = Math.min(totalPages - 1, ordersPage + 1);
+          for (let p = start; p <= end; p++) pages.push(p);
+          if (ordersPage < totalPages - 2) pages.push('…');
+          pages.push(totalPages);
+        }
+
+        for (const p of pages) {
+          if (p === '…') {
+            const span = document.createElement('span');
+            span.textContent = '…';
+            container.appendChild(span);
+          } else {
+            const btn = document.createElement('button');
+            btn.textContent = String(p);
+            if (p === ordersPage) btn.className = 'active';
+            if (p !== ordersPage) btn.addEventListener('click', () => { ordersPage = p; refresh(); });
+            container.appendChild(btn);
+          }
+        }
+
+        // Next
+        container.appendChild((() => {
+          const btn = document.createElement('button');
+          btn.textContent = '>';
+          if (ordersPage >= totalPages) btn.disabled = true;
+          if (!btn.disabled) btn.addEventListener('click', () => { ordersPage = ordersPage + 1; refresh(); });
+          return btn;
+        })());
+      }
+
       async function refresh() {
         try {
           const [ordRes, posRes, trRes, pnlRes] = await Promise.allSettled([
-            fetchJson('api/orders'),
+            fetchJson(`api/orders?limit=${ordersPerPage}&page=${ordersPage}`),
             fetchJson('api/positions'),
             fetchJson(`api/trades?limit=${tradesPerPage}&page=${tradePage}`),
             fetchJson('api/pnl'),
@@ -214,6 +266,8 @@
           setRows(document.querySelector('#orders tbody'), orders.data || [], [
             'market_name', 'outcome', 'side', 'price', 'original_size', 'size_matched', 'status'
           ]);
+          const totalOrderPages = orders.total ? Math.max(1, Math.ceil(orders.total / ordersPerPage)) : 1;
+          renderOrdersPagination(totalOrderPages);
           setPositionRows(
             document.querySelector('#positions-tbody'),
             positions.data || []
