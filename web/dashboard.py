@@ -1064,6 +1064,7 @@ async def close_position(
         body = await request.json()
         token_id = body.get("token_id")
         price = body.get("price")  # Can be None for market, or float for limit
+        fraction = body.get("fraction")  # Optional fraction in (0,1]
         
         if token_id:
             # Close specific position
@@ -1082,8 +1083,18 @@ async def close_position(
             limit_prices = None
             logger.info("Closing all positions with aggressive defaults")
         
+        # Validate optional fraction
+        size_fraction = None
+        if fraction is not None:
+            try:
+                size_fraction = float(fraction)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Invalid fraction format")
+            if not (0.0 < size_fraction <= 1.0):
+                raise HTTPException(status_code=400, detail="fraction must be in (0, 1]")
+
         # Call the close_positions utility
-        closed_count = close_positions(limit_prices)
+        closed_count = close_positions(limit_prices, size_fraction=size_fraction)
         
         return {
             "success": True,

@@ -43,6 +43,7 @@
               <th>Avg Price</th>
               <th>Cur Price</th>
               <th>PnL %</th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody id="positions-tbody"></tbody>
@@ -89,7 +90,63 @@
             td.textContent = v == null ? '' : v;
             tr.appendChild(td);
           }
-          
+          tbody.appendChild(tr);
+        }
+      }
+
+      function setPositionRows(tbody, rows) {
+        tbody.innerHTML = '';
+        for (const row of rows) {
+          const tr = document.createElement('tr');
+          const cols = ['market_name', 'outcome', 'size', 'avgPrice', 'curPrice', 'percentPnl'];
+          for (const c of cols) {
+            const td = document.createElement('td');
+            const v = row[c];
+            td.textContent = v == null ? '' : (typeof v === 'number' ? v : String(v));
+            tr.appendChild(td);
+          }
+
+          const actions = document.createElement('td');
+          actions.className = 'actions-cell';
+
+          const group = document.createElement('div');
+          group.className = 'action-group';
+
+          // Pills: 25%, 50%, 100%, Market
+          const tokenId = row.asset;
+          function makePill(label, fraction, price) {
+            const a = document.createElement('a');
+            a.href = '#';
+            a.className = 'pill';
+            a.textContent = label;
+            a.addEventListener('click', async (e) => {
+              e.preventDefault();
+              try {
+                const payload = { token_id: tokenId };
+                if (typeof fraction === 'number') payload.fraction = fraction;
+                if (price !== undefined) payload.price = price; // can be null
+                const res = await fetch('api/positions/close', {
+                  method: 'POST',
+                  headers: { 'Content-Type': 'application/json' },
+                  credentials: 'same-origin',
+                  body: JSON.stringify(payload),
+                });
+                if (!res.ok) throw new Error('Close request failed');
+                await refresh();
+              } catch (err) {
+                console.error(err);
+              }
+            });
+            return a;
+          }
+
+          group.appendChild(makePill('25%', 0.25));
+          group.appendChild(makePill('50%', 0.5));
+          group.appendChild(makePill('100%', 1.0));
+          group.appendChild(makePill('Market', 1.0, null));
+
+          actions.appendChild(group);
+          tr.appendChild(actions);
           tbody.appendChild(tr);
         }
       }
@@ -158,10 +215,9 @@
           setRows(document.querySelector('#orders tbody'), orders.data || [], [
             'market_name', 'outcome', 'side', 'price', 'original_size', 'size_matched', 'status'
           ]);
-          setRows(
+          setPositionRows(
             document.querySelector('#positions-tbody'),
-            positions.data || [],
-            ['market_name', 'outcome', 'size', 'avgPrice', 'curPrice', 'percentPnl']
+            positions.data || []
           );
           setRows(document.querySelector('#trades tbody'), trades.data || [], [
             'market_name', 'outcome', 'side', 'size', 'price', 'datetime'
