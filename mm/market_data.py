@@ -22,9 +22,12 @@ def to_decimal_token_id(token_id: str) -> str:
     t = str(token_id).strip()
     if t.startswith("0x") or t.startswith("0X"):
         return str(int(t, 16))
-    # assume decimal
-    int(t, 10)
-    return t
+    # assume decimal or opaque string; return as-is for non-hex
+    try:
+        int(t, 10)
+        return t
+    except Exception:
+        return t
 
 @dataclass
 class BookLevel:
@@ -252,9 +255,13 @@ class MarketData:
                 bids.append((float(best_bid), 1.0))
             if best_ask is not None:
                 asks.append((float(best_ask), 1.0))
-            ob = self.books[tid]
-            next_seq = (ob.seq or 0) + 1
-            ob.set_snapshot(bids=bids, asks=asks, seq=next_seq)
+            # Only update snapshot if we have at least one side; avoid clearing existing snapshot on empty data
+            if bids or asks:
+                ob = self.books[tid]
+                next_seq = (ob.seq or 0) + 1
+                ob.set_snapshot(bids=bids, asks=asks, seq=next_seq)
+            else:
+                logger.debug("REST snapshot empty for token %s; preserving existing book", tid)
             logger.info(
                 "REST snapshot backfill: token=%s bid=%s ask=%s bids=%d asks=%d",
                 tid,

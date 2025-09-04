@@ -5,14 +5,14 @@ from logging.handlers import TimedRotatingFileHandler
 from typing import Dict, List
 import time
 import os
-import glob
+ 
 import signal
 
 import requests
 
 from mm.config import load_config
 from mm.market_data import MarketData
-from mm.orders import OrdersClient, OrdersEngine, DesiredQuote
+from mm.orders import OrdersClient, OrdersEngine, DesiredQuote, Side, SyncActions
 from mm.orders import NonRetryableOrderError
 from mm.state import StateStore
 from mm.strategy import AvellanedaLite, build_layered_quotes
@@ -74,50 +74,57 @@ def _fetch_nav_usd(address: str) -> float:
         return 0.0
 
 
-def _cleanup_old_logs(prefix: str, keep_count: int = 5) -> None:
-    """Clean up old log files, keeping only the most recent ones."""
-    try:
-        log_pattern = f"logs/{prefix}*.log"
-        log_files = glob.glob(log_pattern)
-        
-        if len(log_files) > keep_count:
-            # Sort by modification time (newest first)
-            log_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
-            
-            # Remove old files beyond the keep count
-            for old_file in log_files[keep_count:]:
-                try:
-                    os.remove(old_file)
-                    logger.debug("Removed old log file: %s", old_file)
-                except Exception as e:
-                    logger.warning("Failed to remove old log file %s: %s", old_file, e)
-    except Exception as e:
-        logger.warning("Failed to cleanup old logs: %s", e)
+# Legacy log cleanup helper removed; rotating handler handles retention
 
 
 async def main_async(test_mode: bool = False, debug_logging: bool = False) -> None:
-    # Logging setup
-    effective_debug = bool(debug_logging or test_mode)
-    log_level = logging.DEBUG if effective_debug else logging.INFO
-    logging.getLogger("mm.market_data").setLevel(logging.DEBUG if effective_debug else logging.INFO)
+    # Bootstrap logging (will finalize level after loading config)
     log_handlers: list[logging.Handler] = [logging.StreamHandler()]
 
     # Always create logs directory and add timed rotating file handler
     os.makedirs("logs", exist_ok=True)
+    # We need cfg to get dynamic paths, but cfg loads after logging. Use defaults for bootstrap
     file_path = "logs/mm_main.log"
-    fh = TimedRotatingFileHandler(file_path, when="midnight", backupCount=5, encoding="utf-8")
+    backups = 5
+    fh = TimedRotatingFileHandler(file_path, when="midnight", backupCount=backups, encoding="utf-8")
     log_handlers.append(fh)
 
-    logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s", handlers=log_handlers)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s", handlers=log_handlers)
 
     # Log that file logging has started
-    logger.info("Logging to rotating file: %s (daily, keep 5 backups)", file_path)
+    logger.info("Logging to rotating file: %s (daily, keep %d backups)", file_path, backups)
     # Suppress noisy third-party logs; keep our package logs
     logging.getLogger("websockets").setLevel(logging.WARNING)
     logging.getLogger("websockets.client").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
     cfg = load_config()
+    # If config overrides logging file/backups, update handlers now
+    try:
+        new_file = getattr(cfg, "log_file", file_path)
+        new_backups = int(getattr(cfg, "log_rotation_backups", backups) or backups)
+        if new_file != file_path or new_backups != backups:
+            for h in list(log_handlers):
+                if isinstance(h, TimedRotatingFileHandler):
+                    logging.getLogger().removeHandler(h)
+                    log_handlers.remove(h)
+            fh2 = TimedRotatingFileHandler(new_file, when="midnight", backupCount=new_backups, encoding="utf-8")
+            logging.getLogger().addHandler(fh2)
+            log_handlers.append(fh2)
+            file_path = new_file
+            backups = new_backups
+    except Exception:
+        pass
+
+    # Finalize log level: prefer Settings sheet, overridden only by --debug flag
+    try:
+        level_name = str(getattr(cfg, "log_level", "INFO")).upper()
+        final_level = logging.DEBUG if debug_logging else getattr(logging, level_name, logging.INFO)
+        logging.getLogger().setLevel(final_level)
+        # Apply same to key module loggers
+        logging.getLogger("mm.market_data").setLevel(final_level)
+    except Exception:
+        pass
     state = StateStore()
     risk = RiskManager(
         soft_cap_delta_pct=cfg.soft_cap_delta_pct,
@@ -178,7 +185,18 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
             ws_task = None
         if tokens:
             md.backfill_prices(tokens)
-            ws_task = asyncio.create_task(md.run_ws(tokens))
+
+            async def _ws_runner(tok_list: List[str]) -> None:
+                try:
+                    await md.run_ws(tok_list)
+                except Exception as e:
+                    # Treat normal/expected closes as info; others as warnings
+                    msg = str(e)
+                    if "NORMAL_CLOSURE" in msg or "ConnectionClosed" in type(e).__name__:
+                        logger.info("Websocket closed: %s", msg)
+                    else:
+                        logger.warning("Websocket error: %s", msg)
+            ws_task = asyncio.create_task(_ws_runner(tokens))
         else:
             logger.warning("No token_ids derived; skipping WS subscription")
 
@@ -209,7 +227,7 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
     # Orders engine for diffing and lifecycle
     engine = OrdersEngine(
         client=orders,  # type: ignore[arg-type]
-        tick=0.01,
+        tick=float(getattr(cfg, "price_tick", 0.01)),
         partial_fill_pct=50.0,
         order_max_age_sec=cfg.order_max_age_sec,
         requote_mid_ticks=cfg.requote_mid_ticks,
@@ -233,8 +251,23 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
     halt_event = asyncio.Event()
     cooldown_until: Dict[str, float] = {}
     _last_heartbeat: float = 0.0
+    backfill_last_at: Dict[str, float] = {}
 
-    # Selection supervisor (15 min re-pull) handled by existing SelectionManager instance
+    def _compute_mid(best_bid: float | None, best_ask: float | None, tick: float = 0.01) -> float | None:
+        if best_bid is None and best_ask is None:
+            return None
+        if best_bid is not None and best_ask is not None:
+            mid = (float(best_bid) + float(best_ask)) / 2.0
+            if best_bid > best_ask:
+                low, high = float(best_ask), float(best_bid)
+                mid = min(max(mid, low), high)
+        elif best_bid is not None:
+            mid = float(best_bid)
+        else:
+            mid = float(best_ask)
+        return float(min(0.99, max(0.01, mid)))
+
+    # Selection supervisor (periodic re-pull) handled by existing SelectionManager instance
 
     async def selection_loop() -> None:
         nonlocal token_ids, token_to_market, token_to_token1, token_pairs, strategies
@@ -321,12 +354,12 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                 else:
                     logger.debug("No market selection changes detected")
                 
-                # Log periodic status every hour (4th check)
-                if (time.time() - sel.ts) > 3600:  # 1 hour since last change
+                # Log periodic status hourly based on timestamp since last change
+                if (time.time() - sel.ts) > 3600:
                     logger.info("📊 Selection status: %d active markets, %d strategies, %d market mappings", 
                                len(token_ids), len(strategies), len(token_to_market))
                 
-                await asyncio.sleep(900)  # 15 minutes
+                await asyncio.sleep(int(getattr(cfg, "selection_loop_sec", 900)))
             except Exception:
                 logger.exception("Selection loop error")
                 await asyncio.sleep(30)
@@ -370,7 +403,8 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
     try:
         while True:
             # Pull live positions and NAV for inventory-aware quoting
-            wallet = os.getenv("BROWSER_ADDRESS", "")
+            # Standardize wallet source from config
+            wallet = cfg.browser_address or ""
             if wallet:
                 positions_by_token, nav_usd = await asyncio.gather(
                     asyncio.to_thread(_fetch_positions_by_token, wallet),
@@ -382,8 +416,8 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
 
             # Heartbeat every 5s to confirm loop is alive
             try:
-                now_hb = time.time()
-                if now_hb - _last_heartbeat >= 5.0:
+                now_hb = time.monotonic()
+                if now_hb - _last_heartbeat >= float(getattr(cfg, "heartbeat_sec", 5)):
                     logger.debug("MM tick: tokens=%d books=%d", len(token_ids), len(md.books))
                     _last_heartbeat = now_hb
             except Exception:
@@ -403,34 +437,24 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                 bb1 = book1.best_bid()
                 ba1 = book1.best_ask()
                 if bb1 is None and ba1 is None:
-                    now_bf = time.time()
-                    # throttle backfill to once per 10s per token1
-                    globals_dict = globals()
-                    if "_last_backfill_at" not in globals_dict:
-                        globals_dict["_last_backfill_at"] = {}
-                    _lba = globals_dict["_last_backfill_at"]
-                    last_ts = _lba.get(t1, 0.0)
-                    if now_bf - last_ts > 10.0:
+                    now_bf = time.monotonic()
+                    last_ts = backfill_last_at.get(t1, 0.0)
+                    throttle = float(getattr(cfg, "backfill_throttle_sec", 10))
+                    if now_bf - last_ts > throttle:
                         try:
                             md.backfill_top_of_book([t1])
                         except Exception:
                             logger.exception("token1 REST backfill failed for %s", t1)
-                        _lba[t1] = now_bf
+                        backfill_last_at[t1] = now_bf
                     # skip this pair for now; next loop should have levels
                     continue
                 if bb1 is None and ba1 is None:
                     logger.debug("No best levels for token1=%s", t1)
                     continue
-                if bb1 is not None and ba1 is not None:
-                    mid1 = (float(bb1) + float(ba1)) / 2.0
-                    if bb1 > ba1:
-                        low, high = float(ba1), float(bb1)
-                        mid1 = min(max(mid1, low), high)
-                elif bb1 is not None:
-                    mid1 = float(bb1)
-                else:
-                    mid1 = float(ba1)
-                mid1 = float(min(0.99, max(0.01, mid1)))
+                mid1_val = _compute_mid(bb1, ba1)
+                if mid1_val is None:
+                    continue
+                mid1 = float(mid1_val)
                 mid2 = float(min(0.99, max(0.01, 1.0 - mid1)))
                 last_fair_seen[t1] = mid1
                 if t2:
@@ -442,7 +466,7 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                 # Quote helper for a single token (collect desired quotes)
                 def _quote_token(tok: str, fair_mid_val: float) -> None:
                     # Cooldown
-                    now_ts = time.time()
+                    now_ts = time.monotonic()
                     until = cooldown_until.get(tok)
                     if until is not None and now_ts < until:
                         logger.debug("Cooldown active for token %s for %.1fs", tok, until - now_ts)
@@ -467,15 +491,16 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                     if quote is None:
                         return
                     # Apply risk multipliers to pricing (spread and reservation price) before layering
+                    from mm.strategy import StrategyState
                     adj = risk.apply(
-                        state=type("S", (), {
-                            "fair": fair_mid_val,
-                            "sigma": 0.0,
-                            "inventory_usd": inventory_usd,
-                            "bankroll_usd": nav_usd if nav_usd > 0 else 1.0,
-                            "time_to_resolution_sec": 24 * 3600.0,
-                            "tick": 0.01,
-                        })(),
+                        state=StrategyState(
+                            fair=fair_mid_val,
+                            sigma=0.0,
+                            inventory_usd=inventory_usd,
+                            bankroll_usd=nav_usd if nav_usd > 0 else 1.0,
+                            time_to_resolution_sec=24 * 3600.0,
+                            tick=float(cfg.price_tick),
+                        ),
                         token_id=tok,
                         nav_usd=nav_usd,
                     )
@@ -495,6 +520,7 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                         layers=cfg.order_layers,
                         base_size=cfg.base_size_usd,
                         max_size=cfg.max_size_usd,
+                        tick=float(cfg.price_tick),
                     )
                     if adj.size_multiplier != 1.0:
                         lq = type(lq)(
@@ -505,7 +531,7 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                         )
                     api_bid = bookx.best_bid()
                     api_ask = bookx.best_ask()
-                    logger.info(
+                    logger.debug(
                         "Quoting token=%s market=%s mid=%.4f bid=%.4f ask=%.4f layers=%d",
                         tok,
                         cid,
@@ -517,10 +543,10 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                     # Build desired quotes for diffing engine
                     for idx, (bp, sz) in enumerate(zip(lq.bid_prices, lq.sizes)):
                         if sz > 0:
-                            desired_quotes.append(DesiredQuote(token_id=tok, side="BUY", price=float(bp), size=float(sz), level=idx))
+                            desired_quotes.append(DesiredQuote(token_id=tok, side=Side.BUY, price=float(bp), size=float(sz), level=idx))
                     for idx, (ap, sz) in enumerate(zip(lq.ask_prices, lq.sizes)):
                         if sz > 0:
-                            desired_quotes.append(DesiredQuote(token_id=tok, side="SELL", price=float(ap), size=float(sz), level=idx))
+                            desired_quotes.append(DesiredQuote(token_id=tok, side=Side.SELL, price=float(ap), size=float(sz), level=idx))
                     mid_by_token[tok] = float(fair_mid_val)
 
                 _quote_token(t1, mid1)
@@ -530,20 +556,20 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                 try:
                     if not desired_quotes:
                         logger.debug("No desired quotes built this cycle (cooldowns? size=0?). Skipping engine sync.")
-                        actions = {"placed": [], "cancelled": [], "replaced": [], "errors": []}
+                        actions = SyncActions(placed=[], cancelled=[], replaced=[], errors=[])
                     else:
                         actions = engine.sync(desired_quotes, mid_by_token)
                     # Aggregate placed USD by side for diagnostics
-                    placed = actions.get("placed", []) + actions.get("replaced", [])
+                    placed = actions.placed + actions.replaced
                     buy_usd = 0.0
                     sell_usd = 0.0
                     buy_cnt = 0
                     sell_cnt = 0
                     for a in placed:
                         try:
-                            side = str(a.get("side", "")).upper()
-                            price = float(a.get("price", 0.0))
-                            size = float(a.get("size", 0.0))
+                            side = a.side.value
+                            price = float(a.price)
+                            size = float(a.size)
                             usd = price * size
                             if side == "BUY":
                                 buy_usd += usd
@@ -554,16 +580,18 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                         except Exception:
                             continue
                     if buy_cnt or sell_cnt:
-                        logger.info("Placed quotes this cycle: BUY count=%d usd=%.2f, SELL count=%d usd=%.2f", buy_cnt, buy_usd, sell_cnt, sell_usd)
-                    errs = actions.get("errors", [])
+                        # Rate-limited summary: only log if last heartbeat passed threshold
+                        if (time.monotonic() - _last_heartbeat) >= float(getattr(cfg, "heartbeat_sec", 5)):
+                            logger.info("Placed quotes: BUY count=%d usd=%.2f, SELL count=%d usd=%.2f", buy_cnt, buy_usd, sell_cnt, sell_usd)
+                    errs = actions.errors
                     if errs:
                         # Log first few errors and set cooldown only for affected tokens
                         for e in errs[:5]:
-                            logger.warning("Order error token=%s side=%s price=%.4f size=%.2f type=%s err=%s", e.get("token"), e.get("side"), float(e.get("price", 0.0)), float(e.get("size", 0.0)), e.get("type"), e.get("error"))
-                        now_bk = time.time()
+                            logger.warning("Order error token=%s side=%s price=%.4f size=%.2f type=%s err=%s", e.token, e.side.value, float(e.price), float(e.size), e.type, e.error)
+                        now_bk = time.monotonic()
                         for e in errs:
-                            tok_e = str(e.get("token") or "")
-                            if tok_e and str(e.get("type")) == "nonretryable":
+                            tok_e = str(e.token or "")
+                            if tok_e and str(e.type) == "nonretryable":
                                 cooldown_until[tok_e] = now_bk + float(cfg.nonretryable_cooldown_sec)
                     for tok, m in mid_by_token.items():
                         last_quote_ts[tok] = time.time()
@@ -571,7 +599,7 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                 except NonRetryableOrderError as nre:
                     logger.warning("Non-retryable order error: %s", nre)
                     # Apply cooldown/backoff for all tokens we attempted to quote this cycle
-                    now_bk = time.time()
+                    now_bk = time.monotonic()
                     for tok in {dq.token_id for dq in desired_quotes}:
                         cooldown_until[tok] = now_bk + float(cfg.nonretryable_cooldown_sec)
                         logger.info("Cooldown applied for token %s for %.1fs due to non-retryable error", tok, float(cfg.nonretryable_cooldown_sec))

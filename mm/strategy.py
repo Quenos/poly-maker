@@ -62,6 +62,7 @@ class AvellanedaLite:
             fair = self.fair_ewma.update(micro)
             mid_for_vol = fair
         sigma = self._update_vol(mid_for_vol)
+        # Note: tick should be threaded from config; for now fee is expressed in ticks at 0.01
         h = self.k_vol * sigma + self.k_fee_ticks * 0.01
         delta_r = -self.inv_gamma * inventory_norm
         bid = max(0.01, min(0.99, fair + delta_r - h))
@@ -89,16 +90,21 @@ def build_layered_quotes(
     tick: float = 0.01,
     step_ticks: int = 1,
     jitter_ticks: float = 0.25,
+    rng: Optional[random.Random] = None,
 ) -> LayeredQuotes:
+    def _round_to_tick(x: float, t: float) -> float:
+        return max(t, min(1.0 - t, round(x / t) * t))
     bid_prices: List[float] = []
     ask_prices: List[float] = []
     sizes: List[float] = []
     for i in range(max(1, layers)):
         size = min(max_size, base_size * (1.5 ** i))
-        jitter = (random.random() - 0.5) * 2.0 * jitter_ticks * tick
-        bid = max(0.01, min(0.99, base_quote.bid - tick * step_ticks * i + jitter))
-        jitter2 = (random.random() - 0.5) * 2.0 * jitter_ticks * tick
-        ask = max(0.01, min(0.99, base_quote.ask + tick * step_ticks * i + jitter2))
+        r = rng.random() if rng is not None else random.random()
+        jitter = (r - 0.5) * 2.0 * jitter_ticks * tick
+        bid = _round_to_tick(base_quote.bid - tick * step_ticks * i + jitter, tick)
+        r2 = rng.random() if rng is not None else random.random()
+        jitter2 = (r2 - 0.5) * 2.0 * jitter_ticks * tick
+        ask = _round_to_tick(base_quote.ask + tick * step_ticks * i + jitter2, tick)
         bid_prices.append(bid)
         ask_prices.append(ask)
         sizes.append(size)
@@ -238,15 +244,18 @@ class AdvancedAvellanedaStrategy:
 
         # Jitter one tick both sides (symmetric; caller can add time jitter externally)
         j = (random.random() - 0.5) * 2.0 * state.tick
-        yes_bid = max(0.01, min(0.99, yes_bid + j))
-        yes_ask = max(0.01, min(0.99, yes_ask - j))
+        yes_bid = yes_bid + j
+        yes_ask = yes_ask - j
+        # Round to tick after jitter
+        yes_bid = max(0.01, min(0.99, round(yes_bid / state.tick) * state.tick))
+        yes_ask = max(0.01, min(0.99, round(yes_ask / state.tick) * state.tick))
 
         # Parity for NO, avoid self-cross after fees
         no_bid = max(0.01, min(0.99, 1.0 - yes_ask))
         no_ask = max(0.01, min(0.99, 1.0 - yes_bid))
         if no_bid >= no_ask:
             mid_no = (no_bid + no_ask) / 2.0
-            no_bid = max(0.01, mid_no - state.tick)
-            no_ask = min(0.99, mid_no + state.tick)
+            no_bid = max(0.01, min(0.99, round((mid_no - state.tick) / state.tick) * state.tick))
+            no_ask = max(0.01, min(0.99, round((mid_no + state.tick) / state.tick) * state.tick))
 
         return QuotesOut(yes_bid=yes_bid, yes_ask=yes_ask, no_bid=no_bid, no_ask=no_ask, size_multiplier=size_mult)

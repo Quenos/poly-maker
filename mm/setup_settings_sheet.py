@@ -151,6 +151,14 @@ def create_settings_sheet():
             'default': '3'
         },
         {
+            'setting_name': 'PRICE_TICK',
+            'value': '0.01',
+            'type': 'float',
+            'category': 'Order Management',
+            'description': 'Minimum price tick size for quoting and rounding',
+            'default': '0.01'
+        },
+        {
             'setting_name': 'BASE_SIZE_USD',
             'value': '300.0',
             'type': 'float',
@@ -233,11 +241,8 @@ def create_settings_sheet():
             'category': 'Sheet Configuration',
             'description': 'Name of the sheet containing selected markets to trade',
             'default': 'Selected Markets'
-        }
-    ]
-
-    # Merger settings (added without overwriting existing values)
-    merger_settings = [
+        },
+        # Merger settings (inline with main structure)
         {
             'setting_name': 'MERGE_SCAN_INTERVAL_SEC',
             'value': '120',
@@ -286,14 +291,66 @@ def create_settings_sheet():
             'description': 'If true, log planned merges without calling the helper',
             'default': 'false'
         },
+        # Logging
+        {
+            'setting_name': 'LOG_LEVEL',
+            'value': 'INFO',
+            'type': 'string',
+            'category': 'Logging',
+            'description': 'Root logging level (DEBUG/INFO/WARNING/ERROR)',
+            'default': 'INFO'
+        },
+        {
+            'setting_name': 'LOG_FILE',
+            'value': 'logs/mm_main.log',
+            'type': 'string',
+            'category': 'Logging',
+            'description': 'Log file path',
+            'default': 'logs/mm_main.log'
+        },
+        {
+            'setting_name': 'LOG_ROTATION_BACKUPS',
+            'value': '5',
+            'type': 'int',
+            'category': 'Logging',
+            'description': 'Number of rotated log backups to keep',
+            'default': '5'
+        },
+        # Loop intervals
+        {
+            'setting_name': 'SELECTION_LOOP_SEC',
+            'value': '900',
+            'type': 'int',
+            'category': 'Loop Intervals',
+            'description': 'Seconds between selection loop ticks',
+            'default': '900'
+        },
+        {
+            'setting_name': 'HEARTBEAT_SEC',
+            'value': '5',
+            'type': 'int',
+            'category': 'Loop Intervals',
+            'description': 'Seconds between heartbeat logs',
+            'default': '5'
+        },
+        {
+            'setting_name': 'BACKFILL_THROTTLE_SEC',
+            'value': '10',
+            'type': 'int',
+            'category': 'Loop Intervals',
+            'description': 'Seconds throttle for REST backfill per token',
+            'default': '10'
+        },
     ]
-    # Combine all settings for initial creation
-    all_settings = settings_data + merger_settings
     
     # Convert to DataFrame
-    df_all = pd.DataFrame(all_settings)
-    # Reorder columns for better readability
+    df_all = pd.DataFrame(settings_data)
+    # Reorder columns for better readability and sort by category then name
     df_all = df_all[['category', 'setting_name', 'value', 'type', 'default', 'description']]
+    try:
+        df_all = df_all.sort_values(by=['category', 'setting_name']).reset_index(drop=True)
+    except Exception:
+        pass
     
     try:
         # Check if Settings sheet already exists
@@ -310,19 +367,24 @@ def create_settings_sheet():
                         existing_names = set(existing_df['setting_name'].astype(str).tolist())
                 except Exception:
                     existing_names = set()
-            # Determine missing merger settings
-            missing = [row for row in merger_settings if row['setting_name'] not in existing_names]
+            # Determine missing settings across the full defined list
+            missing = [row for row in settings_data if row['setting_name'] not in existing_names]
             if not missing:
-                logger.info("No new merger settings to add.")
+                logger.info("No new settings to add.")
             else:
+                # Sort missing settings by category then name for consistency
+                try:
+                    missing = sorted(missing, key=lambda m: (m['category'], m['setting_name']))
+                except Exception:
+                    pass
                 # Append rows in expected column order
                 rows = [[m['category'], m['setting_name'], m['value'], m['type'], m['default'], m['description']] for m in missing]
                 # Ensure header exists; append after last row
                 existing_sheet.append_rows(rows, value_input_option='RAW')
-                logger.info("Appended %d merger settings without overwriting existing values", len(rows))
+                logger.info("Appended %d settings without overwriting existing values", len(rows))
         except Exception:
             # Create new sheet with all settings
-            logger.info("Creating new Settings sheet with full defaults (including merger settings)...")
+            logger.info("Creating new Settings sheet with full defaults...")
             new_sheet = spreadsheet.add_worksheet(title='Settings', rows=len(df_all) + 1, cols=len(df_all.columns))
             set_with_dataframe(new_sheet, df_all, include_index=False)
         

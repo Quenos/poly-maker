@@ -1,25 +1,24 @@
 ## Polymarket Market-Making Daemon (mm)
 
-This module provides a production-oriented market-making daemon for Polymarket binary markets. It reads a curated list of markets from Google Sheets, enriches metadata from the Gamma API, consumes live market data from the CLOB WebSocket, computes two-sided quotes using Avellaneda-lite strategy, and places orders via py-clob-client. It persists state in sqlite and exposes Prometheus metrics.
+Production-oriented market-making daemon for Polymarket binary markets. Trades a curated list of markets from Google Sheets, enriches via Gamma API, consumes live data from the CLOB WebSocket, computes two-sided quotes (Avellaneda-lite), and places orders via py-clob-client. Persists state in SQLite and exposes Prometheus metrics.
 
 ### Features
-- **Market Selection**: Import markets from Google Sheets with real-time monitoring
-- **Token Processing**: Uses `token1` and `token2` columns from Selected Markets sheet
-- **Gamma API Integration**: Enriches market data via targeted API calls
-- **Live Market Data**: CLOB WebSocket for order books and trades with sequence tracking
-- **Avellaneda-Lite Strategy**: EWMA microprice, volatility-based spreads, inventory skew
-- **Layered Quoting**: Multi-level order placement with configurable sizes and jitter
+- **Market Selection**: Reads `Selected Markets` sheet, monitors changes on an interval
+- **Gamma Enrichment**: Targeted API calls based on `token1`/`token2`
+- **Live Market Data**: WebSocket order books and trades with auto-reconnect and gap recovery
+- **Avellaneda-Lite Strategy**: EWMA fair, volatility-based spread, inventory skew, tick-rounded outputs
+- **Layered Quoting**: Multi-level orders with configurable sizes and jitter (deterministic in tests)
 - **Risk Management**: Soft/hard inventory caps, daily loss limits, markout penalties
-- **Position Tracking**: Real-time position monitoring via Polymarket Data API
-- **State Persistence**: SQLite database for orders, fills, positions, and selection snapshots
-- **Prometheus Metrics**: Comprehensive monitoring and alerting
-- **Enhanced Logging**: Real-time visibility into market selection changes and system updates
- - **On-chain Position Merging**: Automatically merges overlapping YES/NO positions based on configurable thresholds
+- **Orders Engine**: Diffing lifecycle with typed actions; supports `BUY`/`SELL` via `Side` enum
+- **Position Tracking**: Real-time positions via Data API
+- **State & Metrics**: SQLite persistence; Prometheus metrics
+- **Logging**: Rotating file handler; levels configurable via Settings
+- **On-chain Position Merging**: Background merger with configurable thresholds
 
 ### Prerequisites
 - Python 3.10+
 - Virtual environment (recommended) at project root: `.venv/`
-- Google Sheets credentials/json and `SPREADSHEET_URL` env configured
+- Google Sheets credentials/json and `SPREADSHEET_URL` in `.env`
 - Polymarket API access (CLOB and Data API)
 
 **Note**: The new Google Sheets-based configuration system requires the same Google Sheets setup as the existing system. If you're already using Google Sheets for market selection, no additional setup is needed.
@@ -33,136 +32,23 @@ python -m pip install -r requirements.txt
 
 ### Configuration
 
-The market making daemon now supports **two configuration methods**:
+Configuration is managed in Google Sheets (recommended). `.env` only holds secrets.
 
-1. **Google Sheets-based Configuration** (Recommended) - All settings managed in a "Settings" worksheet
-2. **Environment Variables** (Legacy) - Traditional .env file configuration
-
-#### 🆕 Google Sheets Configuration (Recommended)
-
-The new system reads most configuration parameters from a **Settings** worksheet in Google Sheets, providing:
-
-- **Centralized Configuration**: All settings in one place
-- **Easy Updates**: Modify settings without restarting the daemon
-- **Team Collaboration**: Share configuration across team members
-- **Better Documentation**: Each setting includes a description
-
-**Setup**:
-```bash
-# Create the Settings worksheet
-python -m mm.setup_settings_sheet
-
-# Test configuration loading
-python -c "from mm.sheet_config import load_config; config = load_config(); print('Success!')"
-```
-
-**Required .env variables** (only secrets):
+#### Required `.env`
 ```bash
 SPREADSHEET_URL=https://docs.google.com/spreadsheets/d/your-sheet-id
-PK=0x1234567890abcdef...  # Private key (secret)
-BROWSER_ADDRESS=0x1234567890abcdef...  # Wallet address (secret)
+PK=0x...                      # Private key (secret)
+BROWSER_ADDRESS=0x...         # Wallet address (secret)
 ```
 
-**All other settings** are managed in the Google Sheets "Settings" worksheet.
-
-📖 **See `SETTINGS_MIGRATION.md` for detailed migration instructions.**
-
-#### 🔧 Environment Variables (Legacy)
-
-The traditional method using environment variables. All parameters have sensible defaults but can be customized for your trading strategy.
-
-#### Required Environment Variables
-- `SPREADSHEET_URL`: URL of the Google Sheet containing a tab named "Selected Markets" with columns:
-  - `token1`, `token2` (required), `condition_id` (recommended), `Liquidity`, `Volume_24h`, `Volume_7d`, `Volume_30d`
-- `PK`: Private key for CLOB signing (hex string) used by py-clob-client
-- `BROWSER_ADDRESS`: Wallet address used as funder for CLOB client
-
-#### Optional Environment Variables
-
-##### Market Selection Thresholds
-- `MIN_LIQUIDITY`: Minimum liquidity required for market selection (default: 10000.0)
-- `MIN_WEEKLY_VOLUME`: Minimum weekly volume required (default: 50000.0)
-- `MIN_TREND`: Minimum trend score required (default: 0.30)
-- `MM_SCORE_MIN`: Minimum market making score required (default: 1000000.0)
-
-##### Avellaneda-Lite Quoting Strategy
-- `K_VOL`: Volatility parameter for spread calculation (default: 2.0)
-- `K_FEE_TICKS`: Fee parameter in ticks (default: 1.0)
-- `ALPHA_FAIR`: Fair price adjustment factor (default: 0.2)
-- `EWMA_VOL_WINDOW_SEC`: Exponential weighted moving average window for volatility (default: 600)
-- `INV_GAMMA`: Inventory gamma parameter (default: 1.0)
-
-##### Risk Management
-- `SOFT_CAP_DELTA_PCT`: Soft cap for delta exposure percentage (default: 0.015)
-- `HARD_CAP_DELTA_PCT`: Hard cap for delta exposure percentage (default: 0.03)
-- `DAILY_LOSS_LIMIT_PCT`: Daily loss limit percentage (default: 1.0)
-
-##### Order Management
-- `ORDER_LAYERS`: Number of order layers to place (default: 3)
-- `BASE_SIZE_USD`: Base order size in USD (default: 300.0)
-- `MAX_SIZE_USD`: Maximum order size in USD (default: 1500.0)
-- `REQUOTE_MID_TICKS`: Mid-price change threshold for requoting (default: 1)
-- `REQUOTE_QUEUE_LEVELS`: Number of queue levels to consider for requoting (default: 2)
-- `ORDER_MAX_AGE_SEC`: Maximum age of orders before replacement (default: 12)
-
-##### Network Configuration
-- `GAMMA_BASE_URL`: Gamma API base URL (default: "https://gamma-api.polymarket.com")
-- `CLOB_BASE_URL`: CLOB API base URL (default: "https://clob.polymarket.com")
-- `CLOB_WS_URL`: CLOB WebSocket URL (default: "wss://ws-subscriptions-clob.polymarket.com/ws/")
-- `POLYGON_RPC_URL`: Polygon RPC endpoint (default: "https://polygon-rpc.com")
-
-##### Sheet Configuration
-- `SELECTED_SHEET_NAME`: Name of the sheet containing selected markets (default: "Selected Markets")
-
-#### Configuration Examples
-
-##### Basic Market Making Setup
-```bash
-# Required
-SPREADSHEET_URL=https://docs.google.com/spreadsheets/d/your-sheet-id
-PK=0x1234567890abcdef...
-BROWSER_ADDRESS=0x1234567890abcdef...
-
-# Market Making Strategy
-K_VOL=2.0
-ALPHA_FAIR=0.2
-ORDER_LAYERS=3
-BASE_SIZE_USD=300.0
-MAX_SIZE_USD=1500.0
-
-# Risk Management
-SOFT_CAP_DELTA_PCT=0.015
-HARD_CAP_DELTA_PCT=0.03
-DAILY_LOSS_LIMIT_PCT=1.0
-```
-
-##### Conservative Strategy
-```bash
-# Wider spreads, smaller sizes
-K_VOL=3.0
-ALPHA_FAIR=0.1
-BASE_SIZE_USD=150.0
-MAX_SIZE_USD=750.0
-
-# Tighter risk controls
-SOFT_CAP_DELTA_PCT=0.01
-HARD_CAP_DELTA_PCT=0.02
-DAILY_LOSS_LIMIT_PCT=0.5
-```
-
-##### Aggressive Strategy
-```bash
-# Tighter spreads, larger sizes
-K_VOL=1.5
-ALPHA_FAIR=0.3
-BASE_SIZE_USD=500.0
-MAX_SIZE_USD=2500.0
-
-# Relaxed risk controls
-SOFT_CAP_DELTA_PCT=0.02
-HARD_CAP_DELTA_PCT=0.05
-DAILY_LOSS_LIMIT_PCT=2.0
-```
+#### Settings worksheet (created via `python -m mm.setup_settings_sheet`)
+Key settings (non-exhaustive):
+- Strategy and orders: `K_VOL`, `K_FEE_TICKS`, `ALPHA_FAIR`, `INV_GAMMA`, `ORDER_LAYERS`, `BASE_SIZE_USD`, `MAX_SIZE_USD`, `ORDER_MAX_AGE_SEC`, `REQUOTE_MID_TICKS`, `REQUOTE_QUEUE_LEVELS`, `PRICE_TICK`
+- Risk: `SOFT_CAP_DELTA_PCT`, `HARD_CAP_DELTA_PCT`, `DAILY_LOSS_LIMIT_PCT`
+- Networking: `GAMMA_BASE_URL`, `CLOB_BASE_URL`, `CLOB_WS_URL`
+- Logging: `LOG_LEVEL`, `LOG_FILE`, `LOG_ROTATION_BACKUPS`
+- Loop intervals: `SELECTION_LOOP_SEC`, `HEARTBEAT_SEC`, `BACKFILL_THROTTLE_SEC`
+- Sheets: `SELECTED_SHEET_NAME`
 
 #### Parameter Tuning Guide
 
@@ -190,20 +76,21 @@ DAILY_LOSS_LIMIT_PCT=2.0
 - **ORDER_MAX_AGE_SEC**: How frequently to refresh orders
 - **REQUOTE_MID_TICKS**: How much mid-price must move to trigger requoting
 
-### Run the Daemon
+### Run the daemon
 
-#### Production Mode
+#### Production
 ```bash
 source /Users/coenkuijpers/projects/poly-maker/.venv/bin/activate
 PYTHONPATH=/Users/coenkuijpers/projects/poly-maker \
 python /Users/coenkuijpers/projects/poly-maker/mm/main.py
 ```
 
-#### Test Mode
+#### Dry-run
 ```bash
-python -m mm.main --test
+python -m mm.main --test      # no orders sent
+python -m mm.main --debug     # forces DEBUG logging
 ```
-Test mode performs a dry run with no actual orders sent and logs to both console and `logs/mm_main_<timestamp>.log`.
+Logging uses a rotating file handler (`LOG_FILE`, daily rotation, backups via `LOG_ROTATION_BACKUPS`). `--debug` overrides `LOG_LEVEL`; otherwise the level is taken from Settings.
 
 ### What It Does
 1. **Initialization**: Reads "Selected Markets" from Google Sheets
@@ -215,7 +102,7 @@ Test mode performs a dry run with no actual orders sent and logs to both console
 7. **Risk Management**: Applies position caps and loss limits
 8. **Position Tracking**: Monitors real-time positions via Polymarket Data API
 
-### Market Selection Monitoring
+### Market selection monitoring
 
 The daemon provides comprehensive visibility into market selection changes:
 
@@ -237,7 +124,7 @@ Markets REMOVED: ['old_token']
    - Trading strategies: 4
 ```
 
-### Core Components
+### Core components
 
 #### Market Data (`mm/market_data.py`)
 - **OrderBook**: Maintains L2 order book with sequence tracking
@@ -265,8 +152,8 @@ Markets REMOVED: ['old_token']
 
 #### Orders (`mm/orders.py`)
 - **OrdersClient**: Thin wrapper over py-clob-client
-- **OrdersEngine**: Advanced order lifecycle management with diffing and layered quotes
-- **Market Cancellation**: Bulk order cancellation utilities
+- **OrdersEngine**: Order lifecycle management with diffing and layered quotes
+- **Types**: `Side` enum (BUY/SELL), typed `SyncActions` with `placed/replaced/cancelled/errors`
 
 #### Selection (`mm/selection.py`)
 - **SelectionManager**: Google Sheets integration and change detection
@@ -286,9 +173,9 @@ Markets REMOVED: ['old_token']
 - **Default Values**: Pre-populates with recommended configurations
 - **Error Handling**: Robust connection and permission checking
 
-### CLI Tools (`mm/cli.py`)
-
-The market making daemon includes several command-line utilities for data analysis and maintenance operations.
+### CLI (`mm/cli.py`)
+- `export_pnl --date YYYY-MM-DD`
+- `rebuild_positions`
 
 ### Utility Functions (`poly_utils`)
 
@@ -357,9 +244,11 @@ python -m mm.setup_settings_sheet
 
 **Output**: Creates a "Settings" worksheet with 25+ configuration parameters organized by category, including descriptions and default values.
 
-### Market Sheet Creation Tools
-
-The market making system relies on Google Sheets to define which markets to trade. Several tools help create and maintain these sheets with filtered and ranked markets.
+### Settings sheet bootstrap
+Create or update the Settings worksheet:
+```bash
+python -m mm.setup_settings_sheet
+```
 
 #### 1. Market Size Sheet Creation (`update_market_size.py`)
 
@@ -592,7 +481,7 @@ POLYGON_RPC_URL=https://polygon-rpc.com
 - **Sheet Sync Issues**: Verify Google Sheets permissions
 - **Data Quality**: Ensure token IDs are properly formatted as strings
 
-### Persistence & Metrics
+### Persistence & metrics
 
 #### Database Schema
 - **orders**: Order placement history
@@ -629,7 +518,7 @@ PYTHONPATH=/Users/coenkuijpers/projects/poly-maker \
 pytest -q tests/mm/test_strategy.py
 ```
 
-### Operational Notes
+### Operational notes
 
 #### Market Selection
 - The daemon only trades markets listed in "Selected Markets" sheet
@@ -658,7 +547,7 @@ pytest -q tests/mm/test_strategy.py
 #### Configuration Reloads
 - Sending `SIGHUP` reloads configuration for in-process components but does not rebuild the merger loop. If you change merger settings, restart the daemon to apply them.
 
-### Position Merging (On-chain)
+### Position merging (on-chain)
 
 The daemon runs a background merger that scans for overlapping YES/NO positions and merges them on-chain to free USDC collateral.
 
@@ -682,19 +571,9 @@ Notes
 - The merger uses the configured `BROWSER_ADDRESS` (from .env via `sheet_config`) for position lookups and on-chain actions.
 - After changing merger settings, restart the daemon to apply changes to the merger loop.
 
-### Future Enhancements
-
-#### Planned Features
-- **Advanced Order Engine**: Sophisticated order lifecycle management
-- **Portfolio Optimization**: Multi-market position balancing
-- **Advanced Risk Models**: VaR and stress testing capabilities
-- **Performance Analytics**: Detailed PnL attribution and analysis
-
-#### Current Limitations
-- **Single Strategy**: Only Avellaneda-lite currently implemented
-- **Basic Order Management**: Limited order lifecycle features
-- **Manual Configuration**: No automated parameter optimization
-- **Single Exchange**: Polymarket CLOB only
+### Notes
+- WebSocket: normal closures are handled and auto-reconnected.
+- Selection/enrichment logic centralized in `mm/selection.py`.
 
 ### Troubleshooting
 
