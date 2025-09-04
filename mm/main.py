@@ -352,7 +352,7 @@ async def main_async(test_mode: bool = False) -> None:
             logger.info("... and %d more markets", len(initial_tokens) - 5)
 
     async def selection_loop() -> None:
-        nonlocal token_ids, token_to_market, strategies
+        nonlocal token_ids, token_to_market, token_to_token1, token_pairs, strategies
         logger.info("Selection loop started - checking for market changes every 15 minutes")
         while not halt_event.is_set():
             try:
@@ -360,7 +360,15 @@ async def main_async(test_mode: bool = False) -> None:
                 if to_add or to_remove:
                     logger.info("🔄 MARKET SELECTION CHANGE DETECTED - Updating trading configuration")
                     logger.info("Previous active markets: %d", len(token_ids))
-                    
+                    # Cancel orders for removed tokens before reconfiguring
+                    if to_remove:
+                        for tok in to_remove:
+                            try:
+                                orders.cancel_market_orders(asset_id=tok)  # type: ignore[attr-defined]
+                                logger.info("Cancelled orders for removed token %s", tok)
+                            except Exception:
+                                logger.warning("Failed to cancel orders for removed token %s", tok)
+
                     # Update tokens and subscriptions
                     token_ids = sel.active_tokens
                     logger.info("New active markets: %d", len(token_ids))
@@ -370,6 +378,8 @@ async def main_async(test_mode: bool = False) -> None:
                     old_market_count = len(token_to_market)
                     token_to_market.clear()
                     token_to_token1.clear()
+                    # Rebuild token pairs from fresh selection
+                    new_pairs: List[tuple[str, str]] = []
                     cond_col2 = "condition_id" if "condition_id" in enr.columns else ("conditionId" if "conditionId" in enr.columns else None)
                     if cond_col2 is not None:
                         for _, row in enr.iterrows():
@@ -385,6 +395,9 @@ async def main_async(test_mode: bool = False) -> None:
                                 token_to_market[t2v] = mhex
                                 if t1v:
                                     token_to_token1[t2v] = t1v
+                            if t1v and t2v:
+                                new_pairs.append((t1v, t2v))
+                    token_pairs = new_pairs
                     
                     logger.info("Market mappings: %d -> %d", old_market_count, len(token_to_market))
                     
@@ -403,9 +416,17 @@ async def main_async(test_mode: bool = False) -> None:
                                 inv_gamma=cfg.inv_gamma,
                             )
                             new_strategies += 1
+                    # Prune strategies for removed tokens
+                    removed_count = 0
+                    for t in list(strategies.keys()):
+                        if t not in token_ids:
+                            strategies.pop(t, None)
+                            removed_count += 1
                     
                     if new_strategies > 0:
                         logger.info("Created %d new trading strategies", new_strategies)
+                    if removed_count > 0:
+                        logger.info("Pruned %d strategies for removed tokens", removed_count)
                     
                     # Log summary of changes
                     logger.info("✅ Market selection update complete:")
@@ -530,6 +551,8 @@ async def main_async(test_mode: bool = False) -> None:
                         return
                     shares = positions_by_token.get(tok, 0.0)
                     inventory_usd = shares * fair_mid_val
+                    bankroll = nav_usd if nav_usd > 0 else 1.0
+                    inventory_norm = (inventory_usd / bankroll) if bankroll > 0 else 0.0
                     strat = strategies.get(tok) or AvellanedaLite(
                         alpha_fair=cfg.alpha_fair,
                         k_vol=cfg.k_vol,
@@ -538,15 +561,10 @@ async def main_async(test_mode: bool = False) -> None:
                     )
                     strategies[tok] = strat
                     # Drive strategy sigma/microprice off token1 orderbook consistently
-                    quote = strat.compute_quote(book1, 0.0, fair_hint=fair_mid_val)
+                    quote = strat.compute_quote(book1, inventory_norm, fair_hint=fair_mid_val)
                     if quote is None:
                         return
-                    lq = build_layered_quotes(
-                        base_quote=quote,
-                        layers=cfg.order_layers,
-                        base_size=cfg.base_size_usd,
-                        max_size=cfg.max_size_usd,
-                    )
+                    # Apply risk multipliers to pricing (spread and reservation price) before layering
                     adj = risk.apply(
                         state=type("S", (), {
                             "fair": fair_mid_val,
@@ -558,6 +576,23 @@ async def main_async(test_mode: bool = False) -> None:
                         })(),
                         token_id=tok,
                         nav_usd=nav_usd,
+                    )
+                    try:
+                        center0 = (float(quote.bid) + float(quote.ask)) / 2.0
+                        delta_r0 = center0 - float(fair_mid_val)
+                        h0 = max(0.0, (float(quote.ask) - float(quote.bid)) / 2.0)
+                        delta_r1 = delta_r0 * float(adj.gamma_multiplier)
+                        h1 = h0 * float(adj.h_multiplier)
+                        new_bid = max(0.01, min(0.99, float(fair_mid_val) + delta_r1 - h1))
+                        new_ask = max(0.01, min(0.99, float(fair_mid_val) + delta_r1 + h1))
+                        quote = type(quote)(bid=float(new_bid), ask=float(new_ask))
+                    except Exception:
+                        pass
+                    lq = build_layered_quotes(
+                        base_quote=quote,
+                        layers=cfg.order_layers,
+                        base_size=cfg.base_size_usd,
+                        max_size=cfg.max_size_usd,
                     )
                     if adj.size_multiplier != 1.0:
                         lq = type(lq)(
