@@ -34,12 +34,6 @@
 
       <section>
         <h2>Positions</h2>
-        <div class="positions-header">
-          <button id="close-all-btn" class="btn btn-pill btn-danger" title="Submit aggressive orders to close all positions">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h14m0 0l-4-4m4 4l-4 4"/></svg>
-            Close All Positions
-          </button>
-        </div>
         <table id="positions">
           <thead>
             <tr>
@@ -49,7 +43,6 @@
               <th>Avg Price</th>
               <th>Cur Price</th>
               <th>PnL %</th>
-              <th>Actions</th>
             </tr>
           </thead>
           <tbody id="positions-tbody"></tbody>
@@ -97,132 +90,7 @@
             tr.appendChild(td);
           }
           
-          // Add actions column for positions table
-          if (tbody.id === 'positions-tbody') {
-            // Try to find the asset/token ID from various possible field names
-            const assetId = row.asset || row.token_id || row.tokenId || row.asset_id;
-            
-            if (assetId) {
-              const actionsTd = document.createElement('td');
-              actionsTd.className = 'actions-cell';
-              
-              const group = document.createElement('div');
-              group.className = 'action-group';
-              
-              // Create price input
-              const priceInput = document.createElement('input');
-              priceInput.type = 'number';
-              priceInput.step = '0.01';
-              priceInput.min = '0.01';
-              priceInput.max = '0.99';
-              priceInput.placeholder = 'Limit';
-              priceInput.title = 'Limit price (0.01-0.99)';
-              priceInput.className = 'price-input';
-              
-              // Create close at limit button
-              const closeLimitBtn = document.createElement('button');
-              closeLimitBtn.className = 'btn btn-pill btn-primary btn-sm';
-              closeLimitBtn.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h16M4 6h16M4 18h10"/></svg><span>Limit</span>';
-              closeLimitBtn.onclick = () => closePosition(assetId, parseFloat(priceInput.value), [closeLimitBtn, closeMarketBtn]);
-              
-              // Create close at market button
-              const closeMarketBtn = document.createElement('button');
-              closeMarketBtn.className = 'btn btn-pill btn-warning btn-sm';
-              closeMarketBtn.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12l4 4L19 6"/></svg><span>Market</span>';
-              closeMarketBtn.onclick = () => closePosition(assetId, null, [closeLimitBtn, closeMarketBtn]);
-              
-              group.appendChild(priceInput);
-              group.appendChild(closeLimitBtn);
-              group.appendChild(closeMarketBtn);
-              actionsTd.appendChild(group);
-              tr.appendChild(actionsTd);
-            } else {
-              // Add empty actions cell for consistency
-              const actionsTd = document.createElement('td');
-              actionsTd.textContent = 'No asset ID';
-              actionsTd.className = 'actions-cell';
-              tr.appendChild(actionsTd);
-            }
-          }
-          
           tbody.appendChild(tr);
-        }
-      }
-
-      // Function to close a specific position
-      async function closePosition(tokenId, price, buttons) {
-        try {
-          const payload = { token_id: tokenId };
-          if (price !== null && !isNaN(price)) {
-            payload.price = price;
-          }
-          if (Array.isArray(buttons)) {
-            buttons.forEach(b => b && (b.disabled = true));
-          }
-          
-          const response = await fetch('api/positions/close', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify(payload)
-          });
-          
-          if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.detail || 'Failed to close position');
-          }
-          
-          const result = await response.json();
-          alert(`Success: ${result.message}`);
-          
-          // Refresh the dashboard to show updated positions
-          refresh();
-          
-        } catch (error) {
-          console.error('Error closing position:', error);
-          alert(`Error: ${error.message}`);
-        } finally {
-          if (Array.isArray(buttons)) {
-            buttons.forEach(b => b && (b.disabled = false));
-          }
-        }
-      }
-
-      // Function to close all positions
-      async function closeAllPositions() {
-        if (!confirm('Are you sure you want to close ALL positions? This will submit aggressive market orders.')) {
-          return;
-        }
-        
-        try {
-          const allBtn = document.getElementById('close-all-btn');
-          if (allBtn) allBtn.disabled = true;
-          const response = await fetch('api/positions/close', {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({})
-          });
-          
-          if (!response.ok) {
-            const error = await response.json();
-            throw new Error(error.detail || 'Failed to close all positions');
-          }
-          
-          const result = await response.json();
-          alert(`Success: ${result.message}`);
-          
-          // Refresh the dashboard to show updated positions
-          refresh();
-          
-        } catch (error) {
-          console.error('Error closing all positions:', error);
-          alert(`Error: ${error.message}`);
-        } finally {
-          const allBtn = document.getElementById('close-all-btn');
-          if (allBtn) allBtn.disabled = false;
         }
       }
 
@@ -313,10 +181,8 @@
         }
       }
 
-      // Setup event listener for close all button
-      document.addEventListener('DOMContentLoaded', () => {
-        document.getElementById('close-all-btn').addEventListener('click', closeAllPositions);
-      });
+      // Setup page
+      document.addEventListener('DOMContentLoaded', () => {});
 
       refresh();
       setInterval(refresh, 5000);

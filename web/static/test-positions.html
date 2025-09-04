@@ -14,12 +14,6 @@
 
       <section>
         <h2>Positions (Test Data)</h2>
-        <div class="positions-header">
-          <button id="close-all-btn" class="btn btn-pill btn-danger">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12h14m0 0l-4-4m4 4l-4 4"/></svg>
-            Close All Positions
-          </button>
-        </div>
         <table id="positions">
           <thead>
             <tr>
@@ -29,7 +23,6 @@
               <th>Avg Price</th>
               <th>Cur Price</th>
               <th>PnL %</th>
-              <th>Actions</th>
             </tr>
           </thead>
           <tbody id="positions-tbody"></tbody>
@@ -89,93 +82,13 @@
             tr.appendChild(td);
           }
           
-          // Add actions column for positions table
-          if (tbody.id === 'positions-tbody') {
-            // Try to find the asset/token ID from various possible field names
-            const assetId = row.asset || row.token_id || row.tokenId || row.asset_id;
-            
-            if (assetId) {
-              const actionsTd = document.createElement('td');
-              actionsTd.className = 'actions-cell';
-              
-              const group = document.createElement('div');
-              group.className = 'action-group';
-              
-              // Create price input
-              const priceInput = document.createElement('input');
-              priceInput.type = 'number';
-              priceInput.step = '0.01';
-              priceInput.min = '0.01';
-              priceInput.max = '0.99';
-              priceInput.placeholder = 'Limit';
-              priceInput.title = 'Limit price (0.01-0.99)';
-              priceInput.className = 'price-input';
-              
-              // Create close at limit button
-              const closeLimitBtn = document.createElement('button');
-              closeLimitBtn.className = 'btn btn-pill btn-primary btn-sm';
-              closeLimitBtn.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12h16M4 6h16M4 18h10"/></svg><span>Limit</span>';
-              closeLimitBtn.onclick = () => closePosition(assetId, parseFloat(priceInput.value), [closeLimitBtn, closeMarketBtn]);
-              
-              // Create close at market button
-              const closeMarketBtn = document.createElement('button');
-              closeMarketBtn.className = 'btn btn-pill btn-warning btn-sm';
-              closeMarketBtn.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12l4 4L19 6"/></svg><span>Market</span>';
-              closeMarketBtn.onclick = () => closePosition(assetId, null, [closeLimitBtn, closeMarketBtn]);
-              
-              group.appendChild(priceInput);
-              group.appendChild(closeLimitBtn);
-              group.appendChild(closeMarketBtn);
-              actionsTd.appendChild(group);
-              tr.appendChild(actionsTd);
-            } else {
-              // Add empty actions cell for consistency
-              const actionsTd = document.createElement('td');
-              actionsTd.textContent = 'No asset ID';
-              actionsTd.className = 'actions-cell';
-              tr.appendChild(actionsTd);
-            }
-          }
+          // No actions column in test view
           
           tbody.appendChild(tr);
         }
       }
 
-      // Function to close a specific position (mock version)
-      async function closePosition(tokenId, price, buttons) {
-        const message = price !== null && !isNaN(price) 
-          ? `Closing position ${tokenId} at limit price ${price}`
-          : `Closing position ${tokenId} at market`;
-        
-        if (Array.isArray(buttons)) {
-          buttons.forEach(b => b && (b.disabled = true));
-        }
-        
-        alert(`Mock: ${message}`);
-        
-        // Update debug info
-        updateDebugInfo(`Position close requested: ${message}`);
-        
-        if (Array.isArray(buttons)) {
-          buttons.forEach(b => b && (b.disabled = false));
-        }
-      }
-
-      // Function to close all positions (mock version)
-      async function closeAllPositions() {
-        if (!confirm('Are you sure you want to close ALL positions? This will submit aggressive market orders.')) {
-          return;
-        }
-        
-        const allBtn = document.getElementById('close-all-btn');
-        if (allBtn) allBtn.disabled = true;
-        
-        alert('Mock: Closing all positions with aggressive defaults');
-        
-        // Update debug info
-        updateDebugInfo('All positions close requested');
-        if (allBtn) allBtn.disabled = false;
-      }
+      // No close actions in test view
 
       function updateDebugInfo(message) {
         const debugContent = document.getElementById('debug-content');
@@ -185,9 +98,6 @@
 
       // Initialize the test page
       document.addEventListener('DOMContentLoaded', () => {
-        // Setup event listener for close all button
-        document.getElementById('close-all-btn').addEventListener('click', closeAllPositions);
-        
         // Load mock positions
         setRows(
           document.getElementById('positions-tbody'),
@@ -196,7 +106,6 @@
         );
         
         updateDebugInfo('Test page loaded with mock positions');
-        console.log('Test page initialized');
       });
     </script>
   </body>
