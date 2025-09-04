@@ -76,7 +76,6 @@
 
       function setRows(tbody, rows, columns) {
         tbody.innerHTML = '';
-        console.log('setRows called for:', tbody.id, 'with', rows.length, 'rows');
         
         for (const row of rows) {
           const tr = document.createElement('tr');
@@ -151,7 +150,7 @@
         if (Array.isArray(buttons)) {
           buttons.forEach(b => b && (b.disabled = true));
         }
-        console.log(message);
+        
         alert(`Mock: ${message}`);
         
         // Update debug info
@@ -170,7 +169,7 @@
         
         const allBtn = document.getElementById('close-all-btn');
         if (allBtn) allBtn.disabled = true;
-        console.log('Closing all positions');
+        
         alert('Mock: Closing all positions with aggressive defaults');
         
         // Update debug info

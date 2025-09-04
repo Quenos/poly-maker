@@ -77,14 +77,13 @@
 
     <script>
       async function fetchJson(url) {
-        const res = await fetch(url, { cache: 'no-store' });
+        const res = await fetch(url, { cache: 'no-store', credentials: 'same-origin' });
         if (!res.ok) throw new Error('Request failed: ' + url);
         return res.json();
       }
 
       function setRows(tbody, rows, columns) {
         tbody.innerHTML = '';
-        console.log('setRows called for:', tbody.id, 'with', rows.length, 'rows');
         
         for (const row of rows) {
           const tr = document.createElement('tr');
