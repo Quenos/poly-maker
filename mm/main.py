@@ -13,10 +13,10 @@ import requests
 
 from mm.config import load_config
 from mm.market_data import MarketData
-from mm.orders import OrdersClient
+from mm.orders import OrdersClient, OrdersEngine, DesiredQuote
 from mm.orders import NonRetryableOrderError
 from mm.state import StateStore
-from mm.strategy import AvellanedaLite, build_layered_quotes, should_requote
+from mm.strategy import AvellanedaLite, build_layered_quotes
 from mm.risk import RiskManager
 from mm.selection import SelectionManager
 from mm.merge_manager import MergeManager, MergeConfig
@@ -300,12 +300,27 @@ async def main_async(test_mode: bool = False) -> None:
                 self._logger.info("DRY RUN order: token=%s side=%s price=%.4f size=%.2f", token_id, side, price, size)
                 return {"dry_run": True, "token_id": token_id, "side": side, "price": price, "size": size}
 
+            def cancel_market_orders(self, market: str | None = None, asset_id: str | None = None) -> None:
+                self._logger.info("DRY RUN cancel orders: market=%s asset_id=%s", market, asset_id)
+
+            def get_orders(self) -> list[dict]:
+                return []
+
         orders = _DryRunOrders(logger)
     else:
         if not (cfg.pk and cfg.browser_address):
             logger.error("PK and BROWSER_ADDRESS required for order placement")
             return
         orders = OrdersClient(cfg.clob_base_url, cfg.pk, cfg.browser_address, state)
+    # Orders engine for diffing and lifecycle
+    engine = OrdersEngine(
+        client=orders,  # type: ignore[arg-type]
+        tick=0.01,
+        partial_fill_pct=50.0,
+        order_max_age_sec=cfg.order_max_age_sec,
+        requote_mid_ticks=cfg.requote_mid_ticks,
+        requote_queue_levels=cfg.requote_queue_levels,
+    )
 
     # Strategy per YES token id
     strategies: Dict[str, AvellanedaLite] = {}
@@ -317,7 +332,7 @@ async def main_async(test_mode: bool = False) -> None:
             inv_gamma=cfg.inv_gamma,
         )
 
-    # Main loop: compute quotes and place layered orders (skeleton)
+    # Main loop: compute quotes and sync layered orders via engine
     last_quote_ts: Dict[str, float] = {}
     last_mid_seen: Dict[str, float] = {}
     last_fair_seen: Dict[str, float] = {}
@@ -498,7 +513,10 @@ async def main_async(test_mode: bool = False) -> None:
                 if t2:
                     last_fair_seen[t2] = mid2
 
-                # Quote helper for a single token
+                desired_quotes: List[DesiredQuote] = []
+                mid_by_token: Dict[str, float] = {}
+
+                # Quote helper for a single token (collect desired quotes)
                 def _quote_token(tok: str, fair_mid_val: float) -> None:
                     # Cooldown
                     now_ts = time.time()
@@ -522,14 +540,6 @@ async def main_async(test_mode: bool = False) -> None:
                     # Drive strategy sigma/microprice off token1 orderbook consistently
                     quote = strat.compute_quote(book1, 0.0, fair_hint=fair_mid_val)
                     if quote is None:
-                        return
-                    if not should_requote(
-                        last_mid=last_mid_seen.get(tok),
-                        current_mid=fair_mid_val,
-                        last_timestamp=last_quote_ts.get(tok),
-                        order_max_age_sec=cfg.order_max_age_sec,
-                        requote_mid_ticks=cfg.requote_mid_ticks,
-                    ):
                         return
                     lq = build_layered_quotes(
                         base_quote=quote,
@@ -567,24 +577,69 @@ async def main_async(test_mode: bool = False) -> None:
                         (api_ask if api_ask is not None else -1.0),
                         cfg.order_layers,
                     )
-                    try:
-                        for price, size in zip(lq.bid_prices, lq.sizes):
-                            if size > 0:
-                                orders.place_order(tok, "BUY", price, size)
-                        for price, size in zip(lq.ask_prices, lq.sizes):
-                            if size > 0:
-                                orders.place_order(tok, "SELL", price, size)
-                        last_quote_ts[tok] = time.time()
-                        last_mid_seen[tok] = fair_mid_val
-                    except NonRetryableOrderError as nre:
-                        logger.warning("Non-retryable order error for token %s: %s", tok, nre)
-                        cooldown_until[tok] = time.time() + float(cfg.nonretryable_cooldown_sec)
-                    except Exception:
-                        logger.exception("Order placement failed for token %s", tok)
+                    # Build desired quotes for diffing engine
+                    for idx, (bp, sz) in enumerate(zip(lq.bid_prices, lq.sizes)):
+                        if sz > 0:
+                            desired_quotes.append(DesiredQuote(token_id=tok, side="BUY", price=float(bp), size=float(sz), level=idx))
+                    for idx, (ap, sz) in enumerate(zip(lq.ask_prices, lq.sizes)):
+                        if sz > 0:
+                            desired_quotes.append(DesiredQuote(token_id=tok, side="SELL", price=float(ap), size=float(sz), level=idx))
+                    mid_by_token[tok] = float(fair_mid_val)
 
                 _quote_token(t1, mid1)
                 if t2:
                     _quote_token(t2, mid2)
+                # Sync desired quotes once per loop for both tokens
+                try:
+                    if not desired_quotes:
+                        logger.debug("No desired quotes built this cycle (cooldowns? size=0?). Skipping engine sync.")
+                        actions = {"placed": [], "cancelled": [], "replaced": [], "errors": []}
+                    else:
+                        actions = engine.sync(desired_quotes, mid_by_token)
+                    # Aggregate placed USD by side for diagnostics
+                    placed = actions.get("placed", []) + actions.get("replaced", [])
+                    buy_usd = 0.0
+                    sell_usd = 0.0
+                    buy_cnt = 0
+                    sell_cnt = 0
+                    for a in placed:
+                        try:
+                            side = str(a.get("side", "")).upper()
+                            price = float(a.get("price", 0.0))
+                            size = float(a.get("size", 0.0))
+                            usd = price * size
+                            if side == "BUY":
+                                buy_usd += usd
+                                buy_cnt += 1
+                            elif side == "SELL":
+                                sell_usd += usd
+                                sell_cnt += 1
+                        except Exception:
+                            continue
+                    if buy_cnt or sell_cnt:
+                        logger.info("Placed quotes this cycle: BUY count=%d usd=%.2f, SELL count=%d usd=%.2f", buy_cnt, buy_usd, sell_cnt, sell_usd)
+                    errs = actions.get("errors", [])
+                    if errs:
+                        # Log first few errors and set cooldown only for affected tokens
+                        for e in errs[:5]:
+                            logger.warning("Order error token=%s side=%s price=%.4f size=%.2f type=%s err=%s", e.get("token"), e.get("side"), float(e.get("price", 0.0)), float(e.get("size", 0.0)), e.get("type"), e.get("error"))
+                        now_bk = time.time()
+                        for e in errs:
+                            tok_e = str(e.get("token") or "")
+                            if tok_e and str(e.get("type")) == "nonretryable":
+                                cooldown_until[tok_e] = now_bk + float(cfg.nonretryable_cooldown_sec)
+                    for tok, m in mid_by_token.items():
+                        last_quote_ts[tok] = time.time()
+                        last_mid_seen[tok] = m
+                except NonRetryableOrderError as nre:
+                    logger.warning("Non-retryable order error: %s", nre)
+                    # Apply cooldown/backoff for all tokens we attempted to quote this cycle
+                    now_bk = time.time()
+                    for tok in {dq.token_id for dq in desired_quotes}:
+                        cooldown_until[tok] = now_bk + float(cfg.nonretryable_cooldown_sec)
+                        logger.info("Cooldown applied for token %s for %.1fs due to non-retryable error", tok, float(cfg.nonretryable_cooldown_sec))
+                except Exception:
+                    logger.exception("Orders engine sync failed")
             # Also process explicit token pairs to ensure token2 mid=1-mid(token1)
             for t1, t2 in token_pairs:
                 cid = token_to_market.get(t1) or token_to_market.get(t2) or "-"

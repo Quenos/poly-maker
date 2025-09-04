@@ -154,7 +154,7 @@ class OrdersEngine:
         desired: list[DesiredQuote],
         mid_by_token: dict[str, float],
     ) -> dict:
-        actions = {"placed": [], "cancelled": [], "replaced": []}
+        actions = {"placed": [], "cancelled": [], "replaced": [], "errors": []}
         live = list(self.client.get_orders())
         id_to_order = {str(o.get("id") or o.get("order_id")): o for o in live}
         order_to_desired = self._select_mapping(desired, live)
@@ -185,10 +185,26 @@ class OrdersEngine:
                     self.client.cancel_market_orders(asset_id=token)
                 except Exception:
                     pass
-                self.client.place_order(token_id=token, side=dq.side, price=dq.price, size=dq.size)
-                self._created_ts[oid] = self._now()
-                self._price_level_idx[oid] = dq.level
-                actions["replaced"].append({"id": oid, "token": token, "side": dq.side, "price": dq.price})
+                try:
+                    self.client.place_order(token_id=token, side=dq.side, price=dq.price, size=dq.size)
+                    self._created_ts[oid] = self._now()
+                    self._price_level_idx[oid] = dq.level
+                    actions["replaced"].append({"id": oid, "token": token, "side": dq.side, "price": dq.price, "size": dq.size})
+                except NonRetryableOrderError as exc:
+                    actions["errors"].append({"token": token, "side": dq.side, "price": dq.price, "size": dq.size, "type": "nonretryable", "error": str(exc)})
+                    # continue to try other orders
+                except RetryableOrderError as exc:
+                    actions["errors"].append({
+                        "token": token,
+                        "side": dq.side,
+                        "price": dq.price,
+                        "size": dq.size,
+                        "type": "retryable",
+                        "error": str(exc),
+                    })
+                    # continue to try other orders
+                except Exception as exc:
+                    actions["errors"].append({"token": token, "side": dq.side, "price": dq.price, "size": dq.size, "type": "unknown", "error": str(exc)})
             else:
                 used_keys.add((dq.token_id, dq.side, dq.level))
 
@@ -196,11 +212,27 @@ class OrdersEngine:
         for key, dq in desired_keys.items():
             if key in used_keys:
                 continue
-            res = self.client.place_order(token_id=dq.token_id, side=dq.side, price=dq.price, size=dq.size)
-            new_id = str(res.get("order_id") or res.get("id") or f"local_{int(self._now()*1000)}")
-            self._created_ts[new_id] = self._now()
-            self._price_level_idx[new_id] = dq.level
-            actions["placed"].append({"id": new_id, "token": dq.token_id, "side": dq.side, "price": dq.price})
+            try:
+                res = self.client.place_order(token_id=dq.token_id, side=dq.side, price=dq.price, size=dq.size)
+                new_id = str(res.get("order_id") or res.get("id") or f"local_{int(self._now()*1000)}")
+                self._created_ts[new_id] = self._now()
+                self._price_level_idx[new_id] = dq.level
+                actions["placed"].append({"id": new_id, "token": dq.token_id, "side": dq.side, "price": dq.price, "size": dq.size})
+            except NonRetryableOrderError as exc:
+                actions["errors"].append({"token": dq.token_id, "side": dq.side, "price": dq.price, "size": dq.size, "type": "nonretryable", "error": str(exc)})
+                continue
+            except RetryableOrderError as exc:
+                actions["errors"].append({
+                    "token": dq.token_id,
+                    "side": dq.side,
+                    "price": dq.price,
+                    "size": dq.size,
+                    "type": "retryable",
+                    "error": str(exc),
+                })
+                continue
+            except Exception as exc:
+                actions["errors"].append({"token": dq.token_id, "side": dq.side, "price": dq.price, "size": dq.size, "type": "unknown", "error": str(exc)})
 
         # Cancel stray live orders not desired
         desired_prices_by_ts = {(dq.token_id, dq.side): [d.price for d in desired if d.token_id == dq.token_id and d.side == dq.side] for dq in desired}
