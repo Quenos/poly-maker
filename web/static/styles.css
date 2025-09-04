@@ -19,3 +19,18 @@ tbody tr:hover { background: #0f141b; }
 .pagination button.active { background: #3b82f6; border-color: #3b82f6; color: #0b1020; }
 .pagination span { color: #818cf8; padding: 0 4px; }
 
+/* Position controls styling */
+.positions-header { margin-bottom: 12px; display: flex; justify-content: flex-end; }
+.btn { padding: 6px 12px; border-radius: 6px; border: 1px solid; cursor: pointer; font-size: 12px; font-weight: 500; text-decoration: none; display: inline-block; }
+.btn-danger { background: #dc2626; border-color: #dc2626; color: white; }
+.btn-danger:hover { background: #b91c1c; border-color: #b91c1c; }
+.btn-primary { background: #3b82f6; border-color: #3b82f6; color: white; }
+.btn-primary:hover { background: #2563eb; border-color: #2563eb; }
+.btn-warning { background: #f59e0b; border-color: #f59e0b; color: #0b1020; }
+.btn-warning:hover { background: #d97706; border-color: #d97706; }
+.btn-sm { padding: 4px 8px; font-size: 11px; }
+.actions-cell { white-space: nowrap; }
+.actions-cell > * { margin-right: 6px; }
+.actions-cell > *:last-child { margin-right: 0; }
+.price-input { width: 70px; padding: 4px 6px; border: 1px solid #2b3240; background: #1e2632; color: #e6e6e6; border-radius: 4px; font-size: 11px; }
+

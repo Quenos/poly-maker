@@ -308,16 +308,22 @@ class MarketData:
                 async with websockets.connect(self.ws_url, ping_interval=5, ping_timeout=None) as ws:
                     self.ws_connected_gauge.set(1)
                     self.ws_reconnects.inc()
-                    await ws.send(json.dumps({"assets_ids": self.desired_tokens}))
+                    subs = [to_decimal_token_id(t) for t in self.desired_tokens]
+                    logger.info("WS subscribe: %d tokens", len(subs))
+                    await ws.send(json.dumps({"assets_ids": subs}))
                     # Immediately hydrate via REST top-of-book to avoid cold start
                     try:
-                        self.backfill_top_of_book(self.desired_tokens)
+                        self.backfill_top_of_book(subs)
                     except Exception as e:
                         logger.warning("backfill_top_of_book failed on connect: %s", e)
                     last = time.time()
                     while not self._stop:
                         try:
                             msg = await asyncio.wait_for(ws.recv(), timeout=30)
+                            try:
+                                logger.debug("WS message received: %d bytes", len(msg) if isinstance(msg, (str, bytes)) else -1)
+                            except Exception:
+                                logger.debug("WS message received")
                             data = json.loads(msg)
                             self._handle_ws_message(data)
                             last = time.time()
@@ -333,10 +339,10 @@ class MarketData:
 
     def _handle_ws_message(self, data) -> None:
         try:
-            # Case 1: dict with 'assets' (snapshot/diff style)
+            # Align with poly_data.websocket_handlers: expect dict with 'assets'
             if isinstance(data, dict) and "assets" in data:
                 for asset in data.get("assets", []):
-                    token = to_decimal_token_id(str(asset.get("id")))
+                    token = str(asset.get("id"))
                     seq = asset.get("seq")
                     bids = [(float(x[0]), float(x[1])) for x in asset.get("bids", [])]
                     asks = [(float(x[0]), float(x[1])) for x in asset.get("asks", [])]
@@ -350,19 +356,8 @@ class MarketData:
                     self._record_trade(token, price, size, side)
                 return
 
-            # Case 2: list of events with 'event_type' (book/price_change)
-            if isinstance(data, list):
-                for ev in data:
-                    et = ev.get("event_type") if isinstance(ev, dict) else None
-                    if et == "book":
-                        token = to_decimal_token_id(str(ev.get("market")))
-                        bids = [(float(e.get("price")), float(e.get("size"))) for e in ev.get("bids", [])]
-                        asks = [(float(e.get("price")), float(e.get("size"))) for e in ev.get("asks", [])]
-                        self._apply_update(token, bids, asks, seq=None, is_snapshot=True)
-                    elif et == "price_change":
-                        # Optional: apply granular changes; for now, ignore or trigger future refresh
-                        continue
-                return
+            # Ignore other message shapes; we only support the 'assets' schema here.
+            return
 
         except Exception:
             logger.exception("Error handling WS message")

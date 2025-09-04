@@ -479,6 +479,25 @@ def build_market_size_df(
     best_bid_series = pd.to_numeric(df.get("bestBid", 0), errors="coerce").fillna(0.0).astype(float)
     best_ask_series = pd.to_numeric(df.get("bestAsk", 0), errors="coerce").fillna(0.0).astype(float)
     description_series = df.get("description", pd.Series([""] * len(df))).astype(str)
+
+    # Derive negative risk from common keys; default to False
+    def _to_bool(v) -> bool:
+        try:
+            if isinstance(v, bool):
+                return v
+            sv = str(v).strip().lower()
+            return sv in ("1", "true", "yes", "y", "t")
+        except Exception:
+            return False
+    neg_raw = None
+    for key in ("negativeRisk", "negRisk", "isNegativeRisk", "is_negative_risk", "negative_risk"):
+        if key in df.columns:
+            neg_raw = df.get(key)
+            break
+    if neg_raw is None:
+        neg_series = pd.Series([False] * len(df))
+    else:
+        neg_series = pd.Series([_to_bool(x) for x in neg_raw.tolist()])
     # Extract token ids if present (Gamma sometimes exposes as comma-separated string or list)
     clob_ids_raw = df.get("clobTokenIds")
     token1_list: list[str] = []
@@ -515,6 +534,7 @@ def build_market_size_df(
     out["description"] = description_series
     out["token1"] = pd.Series(token1_list, index=out.index)
     out["token2"] = pd.Series(token2_list, index=out.index)
+    out["neg_risk"] = neg_series.astype(bool)
     
     # Ensure token columns are explicitly strings to prevent scientific notation
     out["token1"] = out["token1"].astype(str)
@@ -648,7 +668,7 @@ def main() -> None:
                     # Ensure essential columns are always first in the correct order
                     essential_cols = ["question", "token1", "token2", "condition_id"]
                     
-                    # Additional columns in preferred order
+                    # Additional columns in preferred order (neg_risk handled explicitly at position 5)
                     additional_cols = [
                         "rules", "liquidity", "volume24hr", "avg_volume_1wk", "avg_volume_1mo",
                         "trend_score", "mm_score", "best_bid", "best_ask", "description",
@@ -664,6 +684,10 @@ def main() -> None:
                         else:
                             logger.warning(f"Essential column '{col}' missing from merged data")
                     
+                    # Ensure neg_risk is column 5 if present
+                    if "neg_risk" in merged.columns:
+                        final_cols.append("neg_risk")
+
                     # Add additional columns if present
                     for col in additional_cols:
                         if col in merged.columns:
@@ -706,7 +730,7 @@ def main() -> None:
                 else:
                     # Create empty DataFrame with consistent column ordering
                     out_df = pd.DataFrame(columns=[
-                        "question", "token1", "token2", "condition_id",
+                        "question", "token1", "token2", "condition_id", "neg_risk",
                         "rules", "liquidity", "volume24hr", "avg_volume_1wk", "avg_volume_1mo",
                         "trend_score", "mm_score", "best_bid", "best_ask", "description",
                     ])

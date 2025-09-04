@@ -34,6 +34,9 @@
 
       <section>
         <h2>Positions</h2>
+        <div class="positions-header">
+          <button id="close-all-btn" class="btn btn-danger">Close All Positions</button>
+        </div>
         <table id="positions">
           <thead>
             <tr>
@@ -43,9 +46,10 @@
               <th>Avg Price</th>
               <th>Cur Price</th>
               <th>PnL %</th>
+              <th>Actions</th>
             </tr>
           </thead>
-          <tbody></tbody>
+          <tbody id="positions"></tbody>
         </table>
       </section>
 
@@ -88,7 +92,105 @@
             td.textContent = v == null ? '' : v;
             tr.appendChild(td);
           }
+          
+          // Add actions column for positions table
+          if (tbody.id === 'positions' && row.asset) {
+            const actionsTd = document.createElement('td');
+            actionsTd.className = 'actions-cell';
+            
+            // Create price input
+            const priceInput = document.createElement('input');
+            priceInput.type = 'number';
+            priceInput.step = '0.01';
+            priceInput.min = '0.01';
+            priceInput.max = '0.99';
+            priceInput.placeholder = '0.01-0.99';
+            priceInput.className = 'price-input';
+            
+            // Create close at limit button
+            const closeLimitBtn = document.createElement('button');
+            closeLimitBtn.textContent = 'Close at Limit';
+            closeLimitBtn.className = 'btn btn-primary btn-sm';
+            closeLimitBtn.onclick = () => closePosition(row.asset, parseFloat(priceInput.value));
+            
+            // Create close at market button
+            const closeMarketBtn = document.createElement('button');
+            closeMarketBtn.textContent = 'Close at Market';
+            closeMarketBtn.className = 'btn btn-warning btn-sm';
+            closeMarketBtn.onclick = () => closePosition(row.asset, null);
+            
+            actionsTd.appendChild(priceInput);
+            actionsTd.appendChild(closeLimitBtn);
+            actionsTd.appendChild(closeMarketBtn);
+            tr.appendChild(actionsTd);
+          }
+          
           tbody.appendChild(tr);
+        }
+      }
+
+      // Function to close a specific position
+      async function closePosition(tokenId, price) {
+        try {
+          const payload = { token_id: tokenId };
+          if (price !== null && !isNaN(price)) {
+            payload.price = price;
+          }
+          
+          const response = await fetch('api/positions/close', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify(payload)
+          });
+          
+          if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.detail || 'Failed to close position');
+          }
+          
+          const result = await response.json();
+          alert(`Success: ${result.message}`);
+          
+          // Refresh the dashboard to show updated positions
+          refresh();
+          
+        } catch (error) {
+          console.error('Error closing position:', error);
+          alert(`Error: ${error.message}`);
+        }
+      }
+
+      // Function to close all positions
+      async function closeAllPositions() {
+        if (!confirm('Are you sure you want to close ALL positions? This will submit aggressive market orders.')) {
+          return;
+        }
+        
+        try {
+          const response = await fetch('api/positions/close', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({})
+          });
+          
+          if (!response.ok) {
+            const error = await response.json();
+            throw new Error(error.detail || 'Failed to close all positions');
+          }
+          
+          const result = await response.json();
+          alert(`Success: ${result.message}`);
+          
+          // Refresh the dashboard to show updated positions
+          refresh();
+          
+        } catch (error) {
+          console.error('Error closing all positions:', error);
+          alert(`Error: ${error.message}`);
         }
       }
 
@@ -179,12 +281,15 @@
         }
       }
 
+      // Setup event listener for close all button
+      document.addEventListener('DOMContentLoaded', () => {
+        document.getElementById('close-all-btn').addEventListener('click', closeAllPositions);
+      });
+
       refresh();
       setInterval(refresh, 5000);
-
-      // pagination buttons are created dynamically in renderPagination
     </script>
   </body>
-  </html>
+</html>
 
 

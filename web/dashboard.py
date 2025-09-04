@@ -715,7 +715,7 @@ def get_positions(user=Depends(require_user)) -> Dict[str, Any]:
                 if mask.any():
                     logger.debug("Some market names still missing after API enrichment")
         
-        wanted = ["market_name", "outcome", "size", "avgPrice", "curPrice", "percentPnl"]
+        wanted = ["market_name", "outcome", "size", "avgPrice", "curPrice", "percentPnl", "asset"]
         result = {"data": _df_to_records(pos_df, wanted)}
         logger.info(f"Returning {len(result['data'])} enriched positions")
         return result
@@ -1046,3 +1046,53 @@ def get_open_orders(user=Depends(require_user)) -> Dict[str, Any]:
     except Exception as exc:
         logger.exception("Failed to fetch open orders via poly_utils.open_orders: %s", str(exc))
         raise HTTPException(status_code=500, detail="Failed to fetch open orders")
+
+
+@app.post("/api/positions/close")
+async def close_position(
+    request: Request,
+    user=Depends(require_user)
+) -> Dict[str, Any]:
+    """Close a specific position or all positions using poly_utils.close_positions."""
+    try:
+        from poly_utils.close_positions import close_positions  # type: ignore
+    except Exception as exc:
+        logger.exception("Unable to import close_positions: %s", str(exc))
+        raise HTTPException(status_code=500, detail="close positions helper not available")
+
+    try:
+        body = await request.json()
+        token_id = body.get("token_id")
+        price = body.get("price")  # Can be None for market, or float for limit
+        
+        if token_id:
+            # Close specific position
+            if price is not None:
+                try:
+                    price = float(price)
+                    if not (0.0 < price < 1.0):
+                        raise HTTPException(status_code=400, detail="Price must be between 0.0 and 1.0")
+                except (ValueError, TypeError):
+                    raise HTTPException(status_code=400, detail="Invalid price format")
+            
+            limit_prices = {str(token_id): price}
+            logger.info(f"Closing position for token {token_id} at price {price}")
+        else:
+            # Close all positions
+            limit_prices = None
+            logger.info("Closing all positions with aggressive defaults")
+        
+        # Call the close_positions utility
+        closed_count = close_positions(limit_prices)
+        
+        return {
+            "success": True,
+            "closed_count": closed_count,
+            "message": f"Successfully submitted close orders for {closed_count} positions"
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Error closing positions: %s", str(exc))
+        raise HTTPException(status_code=500, detail=f"Failed to close positions: {str(exc)}")

@@ -289,8 +289,51 @@ Markets REMOVED: ['old_token']
 
 The market making daemon includes several command-line utilities for data analysis and maintenance operations.
 
+### Utility Functions (`poly_utils`)
+
+The project includes shared utility functions in the `poly_utils` module that can be used by various parts of the system.
+
+### Close Positions (`poly_utils.close_positions`)
+
+A utility to flatten positions on Polymarket via **LIMIT** orders using a single `{token_id: price}` map.
+
+- **Explicit price** (`0.0 < price < 1.0`): places a limit order at that price.  
+- **`None` as price**: submits an aggressive *marketable* limit  
+  - `SELL @ 0.01` to close **longs**  
+  - `BUY  @ 0.99` to close **shorts**  
+- **No dict at all** (`None`): closes **all** non-zero positions with aggressive defaults.
+
+**Features**
+- Close specific positions at chosen prices
+- Close all open positions with aggressive defaults
+- Unified dict input: `{token_id: price}` where `price=None` means marketable
+- Programmatic API and CLI interface
+
+**Usage**
+```python
+from poly_utils import close_positions
+
+# Close all positions aggressively (no dict)
+close_positions()
+
+# Close specific tokens at explicit limits
+close_positions({"0xabc...": 0.37, "0xdef...": 0.62})
+
+# Mix explicit price and marketable (None)
+close_positions({"0xabc...": None, "0xdef...": 0.58})
+
+# Close all positions aggressively
+python poly_utils/close_positions.py
+
+# Close specific tokens at explicit limits
+python poly_utils/close_positions.py 0xabc...=0.37 0xdef...=0.62
+
+# Mix explicit price and marketable (None)
+python poly_utils/close_positions.py 0xabc...=None 0xdef...=0.58
+```
+
 #### Export PnL
-```bash
+
 python -m mm.cli export_pnl --date 2025-09-03
 ```
 **What it does**: Exports daily PnL data from the SQLite database to CSV format. This tool aggregates realized and unrealized PnL, fees, and rebates for a specific date, providing detailed performance analysis for reporting and analysis purposes.

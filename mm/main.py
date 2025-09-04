@@ -4,6 +4,7 @@ import logging
 from typing import Dict, List
 import time
 import os
+import glob
 from datetime import datetime
 import signal
 
@@ -18,6 +19,7 @@ from mm.state import StateStore
 from mm.strategy import AvellanedaLite, build_layered_quotes, should_requote
 from mm.risk import RiskManager
 from mm.selection import SelectionManager
+from mm.merge_manager import MergeManager, MergeConfig
 from store_selected_markets import read_sheet
 from poly_utils.google_utils import get_spreadsheet
 
@@ -163,16 +165,51 @@ def enrich_gamma(df: pd.DataFrame, gamma_base: str) -> pd.DataFrame:
         return df
 
 
+def _cleanup_old_logs(prefix: str, keep_count: int = 5) -> None:
+    """Clean up old log files, keeping only the most recent ones."""
+    try:
+        log_pattern = f"logs/{prefix}*.log"
+        log_files = glob.glob(log_pattern)
+        
+        if len(log_files) > keep_count:
+            # Sort by modification time (newest first)
+            log_files.sort(key=lambda x: os.path.getmtime(x), reverse=True)
+            
+            # Remove old files beyond the keep count
+            for old_file in log_files[keep_count:]:
+                try:
+                    os.remove(old_file)
+                    logger.debug("Removed old log file: %s", old_file)
+                except Exception as e:
+                    logger.warning("Failed to remove old log file %s: %s", old_file, e)
+    except Exception as e:
+        logger.warning("Failed to cleanup old logs: %s", e)
+
+
 async def main_async(test_mode: bool = False) -> None:
     # Logging setup
-    log_level = logging.DEBUG if test_mode else logging.INFO
+    log_level = logging.DEBUG if test_mode else logging.DEBUG
+    logging.getLogger("mm.market_data").setLevel(logging.DEBUG)
     log_handlers: list[logging.Handler] = [logging.StreamHandler()]
-    if test_mode:
-        os.makedirs("logs", exist_ok=True)
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        fh = logging.FileHandler(f"logs/mm_test_{ts}.log")
-        log_handlers.append(fh)
+    
+    # Always create logs directory and add file handler
+    os.makedirs("logs", exist_ok=True)
+    
+    # Create timestamp for log filename
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_filename = f"logs/mm_main_{ts}.log"
+    
+    # Clear old main log files (keep only the most recent 5)
+    _cleanup_old_logs("mm_main_")
+    
+    # Create file handler and add to handlers
+    fh = logging.FileHandler(log_filename)
+    log_handlers.append(fh)
+    
     logging.basicConfig(level=log_level, format="%(asctime)s %(levelname)s %(name)s %(message)s", handlers=log_handlers)
+    
+    # Log that file logging has started
+    logger.info("Logging to file: %s", log_filename)
     # Suppress noisy third-party logs; keep our package logs
     logging.getLogger("websockets").setLevel(logging.WARNING)
     logging.getLogger("websockets.client").setLevel(logging.WARNING)
@@ -387,6 +424,17 @@ async def main_async(test_mode: bool = False) -> None:
     except Exception:
         pass
     sel_task = asyncio.create_task(selection_loop())
+    # Start merge manager loop
+    merge_cfg = MergeConfig(
+        merge_scan_interval_sec=cfg.merge_scan_interval_sec,
+        min_merge_usdc=cfg.min_merge_usdc,
+        merge_chunk_usdc=cfg.merge_chunk_usdc,
+        merge_max_retries=cfg.merge_max_retries,
+        merge_retry_backoff_ms=cfg.merge_retry_backoff_ms,
+        dry_run=bool(cfg.merge_dry_run),
+    )
+    merge_mgr = MergeManager(merge_cfg)
+    merge_task = asyncio.create_task(merge_mgr.run_loop(os.getenv("BROWSER_ADDRESS", "")))
     try:
         while True:
             # Pull live positions and NAV for inventory-aware quoting
@@ -575,6 +623,10 @@ async def main_async(test_mode: bool = False) -> None:
                 await ws_task
             except Exception:
                 pass
+        try:
+            merge_task.cancel()
+        except Exception:
+            pass
 
 
 def main() -> None:
