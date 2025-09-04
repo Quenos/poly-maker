@@ -43,7 +43,7 @@
               <th>Avg Price</th>
               <th>Cur Price</th>
               <th>PnL %</th>
-              <th title="Submit close orders for part or all of a position">Close (25/50/100/Mkt)</th>
+              <th>Close 25% / 50% / 100%</th>
             </tr>
           </thead>
           <tbody id="positions-tbody"></tbody>
@@ -143,7 +143,6 @@
           group.appendChild(makePill('25%', 0.25));
           group.appendChild(makePill('50%', 0.5));
           group.appendChild(makePill('100%', 1.0));
-          group.appendChild(makePill('Market', 1.0, null));
 
           actions.appendChild(group);
           tr.appendChild(actions);
