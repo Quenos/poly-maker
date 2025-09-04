@@ -159,15 +159,74 @@ class OrdersEngine:
         id_to_order = {str(o.get("id") or o.get("order_id")): o for o in live}
         order_to_desired = self._select_mapping(desired, live)
 
-        # Global requote trigger per token if mid shift large
+        # Organize desired and live by (token, side) and compute depth from mid
+        def _depth(side: str, price: float, mid: float) -> float:
+            side_u = str(side).upper()
+            if side_u == "BUY":
+                return max(0.0, float(mid) - float(price))
+            return max(0.0, float(price) - float(mid))
+
+        desired_by_ts: dict[tuple[str, str], list[DesiredQuote]] = {}
+        for dq in desired:
+            key = (dq.token_id, dq.side.upper())
+            desired_by_ts.setdefault(key, []).append(dq)
+        for key, lst in desired_by_ts.items():
+            tok, side = key
+            mid = float(mid_by_token.get(tok, 0.5))
+            lst.sort(key=lambda d: _depth(side, d.price, mid))
+
+        live_by_ts: dict[tuple[str, str], list[dict]] = {}
+        for o in live:
+            try:
+                token = str(o.get("asset_id") or o.get("token_id") or o.get("market") or "")
+                side = str(o.get("side") or o.get("action") or o.get("order_side") or "").upper()
+                if not token or side not in ("BUY", "SELL"):
+                    continue
+                live_by_ts.setdefault((token, side), []).append(o)
+            except Exception:
+                continue
+        for key, lst in live_by_ts.items():
+            tok, side = key
+            mid = float(mid_by_token.get(tok, 0.5))
+
+            def sort_key(o: dict) -> float:
+                try:
+                    price = float(o.get("price"))
+                except Exception:
+                    price = 0.0
+                return _depth(side, price, mid)
+            lst.sort(key=sort_key)
+        
+        # Determine which existing live orders to keep: top-N (layers) by closeness to mid per side
+        keep_ids: set[str] = set()
+        depths_by_id: dict[str, float] = {}
+        for key, live_list in live_by_ts.items():
+            tok, side = key
+            desired_list = desired_by_ts.get(key, [])
+            max_levels = max(1, len(desired_list)) if desired_list else 0
+            mid = float(mid_by_token.get(tok, 0.5))
+            for idx, o in enumerate(live_list):
+                oid = str(o.get("id") or o.get("order_id"))
+                try:
+                    price = float(o.get("price"))
+                except Exception:
+                    price = 0.0
+                d = _depth(side, price, mid)
+                depths_by_id[oid] = d
+                if idx < max_levels:
+                    keep_ids.add(oid)
+
+        # Global requote trigger per token if mid shift large (still maintained for age/shift gating)
         requote_tokens: set[str] = set()
         for token, mid in mid_by_token.items():
             if self._mid_shift_ticks(token, mid) >= self.requote_mid_ticks:
                 requote_tokens.add(token)
                 self._last_mid[token] = mid
 
-        desired_keys = {(dq.token_id, dq.side, dq.level): dq for dq in desired}
-        # Identify existing mapped orders and decide keep/replace
+        # Build a set of desired keys for quick membership checks
+        # (kept for potential future use; not required in capacity-based placement)
+        # desired_keys = {(dq.token_id, dq.side, dq.level): dq for dq in desired}
+        # Identify existing mapped orders and decide replace only if it improves closeness and capacity allows
         used_keys: set[tuple[str, str, int]] = set()
         for oid, dq in order_to_desired.items():
             o = id_to_order.get(oid, {})
@@ -179,12 +238,20 @@ class OrdersEngine:
             pct = (filled / orig * 100.0) if orig > 0 else 0.0
             queue_loss = 0  # placeholder proxy; can be enhanced with book depth
             must_replace = (self._needs_replace_due_to_age(oid) or (pct >= self.partial_fill_pct) or (queue_loss >= self.requote_queue_levels) or (token in requote_tokens))
-            if must_replace or abs(float(o.get("price", 0.0)) - dq.price) >= self.tick:
-                # Replace: cancel then place new
-                try:
-                    self.client.cancel_market_orders(asset_id=token)
-                except Exception:
-                    pass
+            # Compute closeness improvement if replaced
+            try:
+                current_price = float(o.get("price", 0.0))
+            except Exception:
+                current_price = 0.0
+            current_depth = _depth(dq.side, current_price, float(mid))
+            desired_depth = _depth(dq.side, dq.price, float(mid))
+            # Capacity for this side
+            max_levels = max(1, len(desired_by_ts.get((token, dq.side.upper()), []))) if desired_by_ts.get((token, dq.side.upper()), []) else 0
+            live_for_side = live_by_ts.get((token, dq.side.upper()), [])
+            capacity_left = max(0, max_levels - len(live_for_side))
+
+            if must_replace and (desired_depth < current_depth) and capacity_left > 0:
+                # Replace only if it moves closer to mid AND capacity exists; avoid mass cancel
                 try:
                     self.client.place_order(token_id=token, side=dq.side, price=dq.price, size=dq.size)
                     self._created_ts[oid] = self._now()
@@ -192,7 +259,6 @@ class OrdersEngine:
                     actions["replaced"].append({"id": oid, "token": token, "side": dq.side, "price": dq.price, "size": dq.size})
                 except NonRetryableOrderError as exc:
                     actions["errors"].append({"token": token, "side": dq.side, "price": dq.price, "size": dq.size, "type": "nonretryable", "error": str(exc)})
-                    # continue to try other orders
                 except RetryableOrderError as exc:
                     actions["errors"].append({
                         "token": token,
@@ -202,51 +268,57 @@ class OrdersEngine:
                         "type": "retryable",
                         "error": str(exc),
                     })
-                    # continue to try other orders
                 except Exception as exc:
                     actions["errors"].append({"token": token, "side": dq.side, "price": dq.price, "size": dq.size, "type": "unknown", "error": str(exc)})
             else:
+                # Keep existing; mark desired level as satisfied
                 used_keys.add((dq.token_id, dq.side, dq.level))
 
-        # Place missing desired
-        for key, dq in desired_keys.items():
-            if key in used_keys:
+        # Place missing desired, respecting capacity and preferring closest levels
+        for (token, side), desired_list in desired_by_ts.items():
+            # Determine capacity left
+            live_for_side = live_by_ts.get((token, side), [])
+            max_levels = max(1, len(desired_list)) if desired_list else 0
+            capacity_left = max(0, max_levels - len(live_for_side))
+            if capacity_left <= 0:
                 continue
-            try:
-                res = self.client.place_order(token_id=dq.token_id, side=dq.side, price=dq.price, size=dq.size)
-                new_id = str(res.get("order_id") or res.get("id") or f"local_{int(self._now()*1000)}")
-                self._created_ts[new_id] = self._now()
-                self._price_level_idx[new_id] = dq.level
-                actions["placed"].append({"id": new_id, "token": dq.token_id, "side": dq.side, "price": dq.price, "size": dq.size})
-            except NonRetryableOrderError as exc:
-                actions["errors"].append({"token": dq.token_id, "side": dq.side, "price": dq.price, "size": dq.size, "type": "nonretryable", "error": str(exc)})
-                continue
-            except RetryableOrderError as exc:
-                actions["errors"].append({
-                    "token": dq.token_id,
-                    "side": dq.side,
-                    "price": dq.price,
-                    "size": dq.size,
-                    "type": "retryable",
-                    "error": str(exc),
-                })
-                continue
-            except Exception as exc:
-                actions["errors"].append({"token": dq.token_id, "side": dq.side, "price": dq.price, "size": dq.size, "type": "unknown", "error": str(exc)})
-
-        # Cancel stray live orders not desired
-        desired_prices_by_ts = {(dq.token_id, dq.side): [d.price for d in desired if d.token_id == dq.token_id and d.side == dq.side] for dq in desired}
-        for oid, o in id_to_order.items():
-            token = str(o.get("asset_id") or o.get("token_id") or "")
-            side = str(o.get("side") or "").upper()
-            price = float(o.get("price") or 0.0)
-            want_prices = desired_prices_by_ts.get((token, side), [])
-            # If price not within 1 tick of any desired, cancel
-            if not any(abs(price - p) < self.tick for p in want_prices):
+            # Prices covered by existing top-N live within 1 tick
+            mid = float(mid_by_token.get(token, 0.5))
+            covered = []
+            for o in live_for_side[:max_levels]:
                 try:
-                    self.client.cancel_market_orders(asset_id=token)
-                    actions["cancelled"].append({"id": oid, "token": token, "side": side})
+                    covered.append(float(o.get("price")))
                 except Exception:
-                    pass
+                    continue
+            
+            def is_covered(p: float) -> bool:
+                return any(abs(p - cp) < self.tick for cp in covered)
+            for dq in desired_list:
+                if capacity_left <= 0:
+                    break
+                if is_covered(dq.price):
+                    continue
+                try:
+                    res = self.client.place_order(token_id=dq.token_id, side=dq.side, price=dq.price, size=dq.size)
+                    new_id = str(res.get("order_id") or res.get("id") or f"local_{int(self._now()*1000)}")
+                    self._created_ts[new_id] = self._now()
+                    self._price_level_idx[new_id] = dq.level
+                    actions["placed"].append({"id": new_id, "token": dq.token_id, "side": dq.side, "price": dq.price, "size": dq.size})
+                    capacity_left -= 1
+                except NonRetryableOrderError as exc:
+                    actions["errors"].append({"token": dq.token_id, "side": dq.side, "price": dq.price, "size": dq.size, "type": "nonretryable", "error": str(exc)})
+                except RetryableOrderError as exc:
+                    actions["errors"].append({
+                        "token": dq.token_id,
+                        "side": dq.side,
+                        "price": dq.price,
+                        "size": dq.size,
+                        "type": "retryable",
+                        "error": str(exc),
+                    })
+                except Exception as exc:
+                    actions["errors"].append({"token": dq.token_id, "side": dq.side, "price": dq.price, "size": dq.size, "type": "unknown", "error": str(exc)})
+
+        # Do NOT cancel existing closer orders when deeper desired appear; skip mass cancellations
 
         return actions
