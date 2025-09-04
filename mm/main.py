@@ -19,6 +19,8 @@ from mm.strategy import AvellanedaLite, build_layered_quotes
 from mm.risk import RiskManager
 from mm.selection import SelectionManager
 from mm.merge_manager import MergeManager, MergeConfig
+from web3 import Web3
+from poly_data.abis import erc20_abi
 
 logger = logging.getLogger("mm")
 
@@ -73,6 +75,21 @@ def _fetch_nav_usd(address: str) -> float:
         logger.exception("Failed to fetch NAV for %s", address)
         return 0.0
 
+
+# Direct on-chain USDC balance (cash only)
+def _fetch_usdc_balance(address: str) -> float:
+    try:
+        rpc = os.getenv("POLYGON_RPC_URL", "https://polygon-rpc.com")
+        web3 = Web3(Web3.HTTPProvider(rpc, request_kwargs={"timeout": 10}))
+        usdc = web3.eth.contract(
+            address=Web3.to_checksum_address("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174"),
+            abi=erc20_abi,
+        )
+        bal = usdc.functions.balanceOf(Web3.to_checksum_address(address)).call()
+        return float(bal) / 10**6
+    except Exception:
+        logger.exception("Failed to fetch USDC balance for %s", address)
+        return 0.0
 
 # Legacy log cleanup helper removed; rotating handler handles retention
 
@@ -419,6 +436,14 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                 now_hb = time.monotonic()
                 if now_hb - _last_heartbeat >= float(getattr(cfg, "heartbeat_sec", 5)):
                     logger.debug("MM tick: tokens=%d books=%d", len(token_ids), len(md.books))
+                    # Heartbeat-level cash-only debug (on-chain USDC balance)
+                    try:
+                        if wallet:
+                            cash_usdc = _fetch_usdc_balance(wallet)
+                            logger.debug("Cash (USDC) balance only: %.2f", cash_usdc)
+                    except Exception:
+                        # Errors are already logged inside _fetch_usdc_balance
+                        pass
                     _last_heartbeat = now_hb
             except Exception:
                 pass
