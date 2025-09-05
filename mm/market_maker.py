@@ -343,6 +343,8 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
     last_fair_seen: Dict[str, float] = {}
     halt_event = asyncio.Event()
     cooldown_until: Dict[str, float] = {}
+    # Throttle cancellations when position exceeds max cap to avoid spamming API
+    overcap_cancel_until: Dict[str, float] = {}
     _last_heartbeat: float = 0.0
     backfill_last_at: Dict[str, float] = {}
 
@@ -738,10 +740,23 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                                     max_shares = float(getattr(cfg, "max_position_shares", 500))
                                     allowed_shares = max(0.0, max_shares - current_shares)
                                     if allowed_shares <= 0.0:
-                                        logger.debug(
-                                            "Skipping BUY due to position cap: token=%s current=%.2f cap=%.2f",
+                                        logger.info(
+                                            "Position over cap: token=%s current=%.2f cap=%.2f — cancelling BUYs",
                                             tok, current_shares, max_shares
                                         )
+                                        # Cancel existing orders to ensure no additional BUY executions
+                                        try:
+                                            now_cancel = time.monotonic()
+                                            next_ok = overcap_cancel_until.get(tok, 0.0)
+                                            if now_cancel >= next_ok:
+                                                orders.cancel_market_orders(asset_id=tok)  # type: ignore[attr-defined]
+                                                # Space out subsequent cancels
+                                                overcap_cancel_until[tok] = now_cancel + float(getattr(cfg, "order_max_age_sec", 12))
+                                                logger.info("Cancelled open orders for over-cap token %s", tok)
+                                            else:
+                                                logger.debug("Over-cap cancel throttle active for %s", tok)
+                                        except Exception:
+                                            logger.warning("Failed to cancel open orders for over-cap token %s", tok)
                                         continue
                                     # Convert USD size to shares at bid price and clamp to allowed
                                     intended_shares = float(sz) / float(bp) if float(bp) > 0 else 0.0
