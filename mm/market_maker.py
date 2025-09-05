@@ -21,6 +21,7 @@ from mm.selection import SelectionManager
 from mm.merge_manager import MergeManager, MergeConfig
 from web3 import Web3
 from poly_data.abis import erc20_abi
+from poly_data.polymarket_client import PolymarketClient
 
 logger = logging.getLogger("mm")
 
@@ -52,6 +53,34 @@ def _fetch_positions_by_token(address: str) -> Dict[str, float]:
             out[token] = val
     except Exception:
         logger.exception("Failed to fetch positions for %s", address)
+    return out
+
+def _fetch_positions_by_token_via_client(client: PolymarketClient) -> Dict[str, float]:
+    """Fetch current positions via PolymarketClient.get_all_positions and return token_id -> shares (float)."""
+    out: Dict[str, float] = {}
+    try:
+        df = client.get_all_positions()
+        if df is None:
+            return out
+        # Determine token id column
+        tok_col = None
+        for c in ("asset", "token_id", "tokenId", "asset_id", "id"):
+            if c in df.columns:
+                tok_col = c
+                break
+        if tok_col is None or "size" not in df.columns:
+            return out
+        for _, row in df.iterrows():
+            try:
+                tok = str(row.get(tok_col) or "").strip()
+                if not tok:
+                    continue
+                sz = float(row.get("size") or 0.0)
+                out[tok] = sz
+            except Exception:
+                continue
+    except Exception:
+        logger.exception("Failed to fetch positions via client")
     return out
  
 def _fetch_nav_usd(address: str) -> float:
@@ -174,6 +203,11 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
     except Exception:
         pass
     state = StateStore()
+    # Initialize Polymarket client once for consistent positions view
+    try:
+        pm_client = PolymarketClient(initialize_api=True)
+    except Exception:
+        pm_client = None  # Fallback to data-api path
     risk = RiskManager(
         soft_cap_delta_pct=cfg.soft_cap_delta_pct,
         hard_cap_delta_pct=cfg.hard_cap_delta_pct,
@@ -579,11 +613,18 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
             # Standardize wallet source from config
             wallet = cfg.browser_address or ""
             if wallet:
-                positions_by_token, pos_value_usd, cash_usdc = await asyncio.gather(
-                    asyncio.to_thread(_fetch_positions_by_token, wallet),
-                    asyncio.to_thread(_fetch_positions_value_usd, wallet),
-                    asyncio.to_thread(_fetch_usdc_balance, wallet),
-                )
+                if pm_client is not None:
+                    positions_by_token, pos_value_usd, cash_usdc = await asyncio.gather(
+                        asyncio.to_thread(_fetch_positions_by_token_via_client, pm_client),
+                        asyncio.to_thread(_fetch_positions_value_usd, wallet),
+                        asyncio.to_thread(_fetch_usdc_balance, wallet),
+                    )
+                else:
+                    positions_by_token, pos_value_usd, cash_usdc = await asyncio.gather(
+                        asyncio.to_thread(_fetch_positions_by_token, wallet),
+                        asyncio.to_thread(_fetch_positions_value_usd, wallet),
+                        asyncio.to_thread(_fetch_usdc_balance, wallet),
+                    )
                 total_bankroll_usd = float(max(0.0, pos_value_usd)) + float(max(0.0, cash_usdc))
             else:
                 positions_by_token = {}
@@ -765,7 +806,7 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                             max_shares = float(getattr(cfg, "max_position_shares", 500))
                         except Exception:
                             max_shares = 500.0
-                        # Sum open BUY orders in shares for this token
+                        # Sum remaining open BUY orders in shares for this token (original - matched)
                         open_buy_shares = 0.0
                         try:
                             for o in live_orders_all:
@@ -775,14 +816,31 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                                     if o_tok != tok or o_side != "BUY":
                                         continue
                                     o_price = float(o.get("price") or 0.0)
-                                    o_size_usd = float(o.get("original_size") or o.get("size") or 0.0)
-                                    if o_price > 0.0 and o_size_usd > 0.0:
-                                        open_buy_shares += (o_size_usd / o_price)
+                                    # Prefer remaining size if available
+                                    size_rem = None
+                                    try:
+                                        orig = float(o.get("original_size") or 0.0)
+                                        filled = float(o.get("size_matched") or 0.0)
+                                        rem = max(0.0, orig - filled)
+                                        size_rem = rem if rem > 0.0 else None
+                                    except Exception:
+                                        size_rem = None
+                                    if size_rem is None:
+                                        size_rem = float(o.get("size") or o.get("remaining_size") or 0.0)
+                                    if o_price > 0.0 and size_rem > 0.0:
+                                        open_buy_shares += (size_rem / o_price)
                                 except Exception:
                                     continue
                         except Exception:
                             open_buy_shares = 0.0
                         shares_budget = max(0.0, max_shares - current_shares - open_buy_shares)
+                        try:
+                            logger.debug(
+                                "Cap check %s: cap=%.2f current=%.2f open_buy_shares=%.2f budget=%.2f",
+                                tok, max_shares, current_shares, open_buy_shares, shares_budget
+                            )
+                        except Exception:
+                            pass
                         # If no capacity remains, proactively cancel open BUYs (throttled) and skip placing new BUYs
                         if shares_budget <= 0.0:
                             try:
