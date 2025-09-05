@@ -102,7 +102,11 @@ def build_layered_quotes(
     jitter_ticks: float = 0.25,
     rng: Optional[random.Random] = None,
 ) -> LayeredQuotes:
-    def _round_to_tick(x: float, t: float) -> float:
+    # Ensure positive tick/step for correct ladder direction
+    t = abs(tick) if tick != 0 else 0.01
+    st = max(1, abs(step_ticks))
+
+    def _round_to_tick(x: float) -> float:
         return max(t, min(1.0 - t, round(x / t) * t))
     bid_prices: List[float] = []
     ask_prices: List[float] = []
@@ -110,11 +114,18 @@ def build_layered_quotes(
     for i in range(max(1, layers)):
         size = min(max_size, base_size * (1.5 ** i))
         r = rng.random() if rng is not None else random.random()
-        jitter = (r - 0.5) * 2.0 * jitter_ticks * tick
-        bid = _round_to_tick(base_quote.bid - tick * step_ticks * i + jitter, tick)
+        jitter = (r - 0.5) * 2.0 * jitter_ticks * t
+        # Base ladder direction: bids descend, asks ascend
+        bid = _round_to_tick(base_quote.bid - t * st * i + jitter)
         r2 = rng.random() if rng is not None else random.random()
-        jitter2 = (r2 - 0.5) * 2.0 * jitter_ticks * tick
-        ask = _round_to_tick(base_quote.ask + tick * step_ticks * i + jitter2, tick)
+        jitter2 = (r2 - 0.5) * 2.0 * jitter_ticks * t
+        ask = _round_to_tick(base_quote.ask + t * st * i + jitter2)
+        # Enforce monotonicity despite jitter/rounding
+        if i > 0:
+            if bid >= bid_prices[-1]:
+                bid = max(t, bid_prices[-1] - t)
+            if ask <= ask_prices[-1]:
+                ask = min(1.0 - t, ask_prices[-1] + t)
         bid_prices.append(bid)
         ask_prices.append(ask)
         sizes.append(size)

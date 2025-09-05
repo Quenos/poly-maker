@@ -3,26 +3,28 @@ import os                           # Operating system interface
 
 # Polymarket API client libraries
 from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import OrderArgs, BalanceAllowanceParams, AssetType, PartialCreateOrderOptions
+from py_clob_client.clob_types import OrderArgs, PartialCreateOrderOptions
 from py_clob_client.constants import POLYGON
 
 # Web3 libraries for blockchain interaction
 from web3 import Web3
 from web3.middleware import ExtraDataToPOAMiddleware
-from eth_account import Account
+from eth_account import Account  # noqa: F401 (imported for potential future use)
 
 import requests                     # HTTP requests
 import pandas as pd                 # Data analysis
-import json                         # JSON processing
+import json                         # JSON processing  # noqa: F401
 import subprocess                   # For calling external processes
 
 from py_clob_client.clob_types import OpenOrderParams
+import logging
 
 # Smart contract ABIs
 from poly_data.abis import NegRiskAdapterABI, ConditionalTokenABI, erc20_abi
 
 # Load environment variables
 load_dotenv()
+logger = logging.getLogger(__name__)
 
 
 class PolymarketClient:
@@ -45,16 +47,16 @@ class PolymarketClient:
         Args:
             pk (str, optional): Private key identifier, defaults to 'default'
         """
-        host="https://clob.polymarket.com"
+        host = "https://clob.polymarket.com"
 
         # Get credentials from environment variables
-        key=os.getenv("PK")
+        key = os.getenv("PK")
         browser_address = os.getenv("BROWSER_ADDRESS")
 
         # Don't print sensitive wallet information
         print("Initializing Polymarket client...")
-        chain_id=POLYGON
-        self.browser_wallet=Web3.to_checksum_address(browser_address)
+        chain_id = POLYGON
+        self.browser_wallet = Web3.to_checksum_address(browser_address)
 
         # Initialize the Polymarket API client (optional)
         self.client = None
@@ -103,7 +105,6 @@ class PolymarketClient:
 
         self.web3 = web3
 
-    
     def create_order(self, marketId, action, price, size, neg_risk=False):
         """
         Create and submit a new order to the Polymarket order book.
@@ -129,7 +130,7 @@ class PolymarketClient:
         signed_order = None
 
         # Handle regular vs negative risk markets differently
-        if neg_risk == False:
+        if neg_risk is False:
             signed_order = self.client.create_order(order_args)
         else:
             signed_order = self.client.create_order(order_args, options=PartialCreateOrderOptions(neg_risk=True))
@@ -155,7 +156,6 @@ class PolymarketClient:
         orderBook = self.client.get_order_book(market)
         return pd.DataFrame(orderBook.bids).astype(float), pd.DataFrame(orderBook.asks).astype(float)
 
-
     def get_usdc_balance(self):
         """
         Get the USDC balance of the connected wallet.
@@ -164,7 +164,7 @@ class PolymarketClient:
             float: USDC balance in decimal format
         """
         return self.usdc_contract.functions.balanceOf(self.browser_wallet).call() / 10**6
-     
+
     def get_pos_balance(self):
         """
         Get the total value of all positions for the connected wallet.
@@ -194,11 +194,28 @@ class PolymarketClient:
         Returns:
             DataFrame: All positions with details like market, size, avgPrice
         """
-        res = requests.get(
-            f'https://data-api.polymarket.com/positions?user={self.browser_wallet}',
-            timeout=15,
-        )
-        return pd.DataFrame(res.json())
+        try:
+            res = requests.get(
+                f'https://data-api.polymarket.com/positions?user={self.browser_wallet}',
+                headers={"User-Agent": "poly-maker-dashboard/1.0", "Accept": "application/json"},
+                timeout=10,
+            )
+            if res.status_code == 429 or not res.ok:
+                try:
+                    preview = (res.text or "")[:200]
+                except Exception:
+                    preview = ""
+                logger.warning("/positions GET failed %s -> %d %s", res.url, res.status_code, preview)
+                return pd.DataFrame()
+            try:
+                data = res.json()
+            except Exception:
+                logger.warning("/positions JSON decode failed: status=%d content_type=%s", res.status_code, res.headers.get("content-type"))
+                return pd.DataFrame()
+            return pd.DataFrame(data)
+        except Exception as exc:
+            logger.exception("/positions GET error: %s", str(exc))
+            return pd.DataFrame()
     
     def get_raw_position(self, tokenId):
         """
@@ -249,7 +266,7 @@ class PolymarketClient:
                 orders_df[col] = orders_df[col].astype(float)
 
         return orders_df
-    
+
     def get_market_orders(self, market):
         """
         Get all open orders for a specific market.
@@ -272,7 +289,6 @@ class PolymarketClient:
                 orders_df[col] = orders_df[col].astype(float)
 
         return orders_df
-    
 
     def cancel_all_asset(self, asset_id):
         """
@@ -285,8 +301,6 @@ class PolymarketClient:
             return
         self.client.cancel_market_orders(asset_id=str(asset_id))
 
-
-    
     def cancel_all_market(self, marketId):
         """
         Cancel all orders in a specific market.
@@ -298,7 +312,6 @@ class PolymarketClient:
             return
         self.client.cancel_market_orders(market=marketId)
 
-    
     def merge_positions(self, amount_to_merge, condition_id, is_neg_risk_market):
         """
         Merge positions in a market to recover collateral.
