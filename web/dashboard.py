@@ -718,6 +718,27 @@ def get_positions(user=Depends(require_user)) -> Dict[str, Any]:
                         pos_df.loc[mask, "outcome"] = pos_df.loc[mask, asset_col].astype(str).map(t2o_f).fillna("")
                         logger.info(f"Updated {len(t2o_f)} outcomes from markets API")
             
+            # 4) Refresh curPrice using best executable price for closing side
+            try:
+                if asset_col and "size" in pos_df.columns:
+                    def _best_price_row(row):
+                        try:
+                            tok = str(row.get(asset_col) or "")
+                            sz = float(row.get("size") or 0.0)
+                        except Exception:
+                            return row.get("curPrice", 0.0)
+                        if not tok or sz == 0.0:
+                            return row.get("curPrice", 0.0)
+                        side = "sell" if sz > 0 else "buy"
+                        try:
+                            return float(get_best_price(tok, side))
+                        except Exception:
+                            return row.get("curPrice", 0.0)
+                    pos_df["curPrice"] = pos_df.apply(_best_price_row, axis=1)
+                    logger.info("Refreshed curPrice for %d positions from order book best prices", len(pos_df))
+            except Exception as exc:
+                logger.debug("Failed to refresh curPrice: %s", str(exc))
+
             # No Google Sheets fallback; rely on Gamma/data APIs only
             
             if "market" in pos_df.columns:
