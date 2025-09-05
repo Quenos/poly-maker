@@ -603,6 +603,12 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
             except Exception:
                 pass
 
+            # Fetch live orders once per cycle for capacity checks
+            try:
+                live_orders_all = orders.get_orders()  # type: ignore[attr-defined]
+            except Exception:
+                live_orders_all = []
+
             # Process by token pairs to ensure token1/token2 consistency
             # Quote strictly by token pairs to avoid side mixing
             for t1 in list({p[0] for p in token_pairs}):
@@ -725,6 +731,49 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                     if tok in suspended_tokens:
                         logger.debug("BUYs suspended by sheet for token=%s; skipping BUY quotes", tok)
                     else:
+                        # Compute remaining buy capacity in SHARES accounting for open BUY orders
+                        try:
+                            current_shares = float(positions_by_token.get(tok, 0.0))
+                        except Exception:
+                            current_shares = 0.0
+                        try:
+                            max_shares = float(getattr(cfg, "max_position_shares", 500))
+                        except Exception:
+                            max_shares = 500.0
+                        # Sum open BUY orders in shares for this token
+                        open_buy_shares = 0.0
+                        try:
+                            for o in live_orders_all:
+                                try:
+                                    o_tok = str(o.get("asset_id") or o.get("token_id") or o.get("market") or "")
+                                    o_side = str(o.get("side") or o.get("action") or o.get("order_side") or "").upper()
+                                    if o_tok != tok or o_side != "BUY":
+                                        continue
+                                    o_price = float(o.get("price") or 0.0)
+                                    o_size_usd = float(o.get("original_size") or o.get("size") or 0.0)
+                                    if o_price > 0.0 and o_size_usd > 0.0:
+                                        open_buy_shares += (o_size_usd / o_price)
+                                except Exception:
+                                    continue
+                        except Exception:
+                            open_buy_shares = 0.0
+                        shares_budget = max(0.0, max_shares - current_shares - open_buy_shares)
+                        # If no capacity remains, proactively cancel open BUYs (throttled) and skip placing new BUYs
+                        if shares_budget <= 0.0:
+                            try:
+                                now_cancel = time.monotonic()
+                                next_ok = overcap_cancel_until.get(tok, 0.0)
+                                if now_cancel >= next_ok:
+                                    orders.cancel_market_orders(asset_id=tok)  # type: ignore[attr-defined]
+                                    overcap_cancel_until[tok] = now_cancel + float(getattr(cfg, "order_max_age_sec", 12))
+                                    logger.info(
+                                        "No BUY capacity (cap=%s, pos=%.2f, open_buys=%.2f). Cancelled open orders for %s",
+                                        f"{max_shares:.0f}", current_shares, open_buy_shares, tok,
+                                    )
+                                else:
+                                    logger.debug("No BUY capacity for %s; cancel throttle active", tok)
+                            except Exception:
+                                logger.warning("Failed to cancel open orders for %s when capacity is 0", tok)
                         for idx, (bp, sz) in enumerate(zip(lq.bid_prices, lq.sizes)):
                             if sz > 0:
                                 # Safeguard: minimum buy price
@@ -734,49 +783,25 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                                         tok, float(bp), float(getattr(cfg, "min_buy_price", 0.15))
                                     )
                                     continue
-                                # Position cap in shares (cap applies to long exposure growth)
-                                try:
-                                    current_shares = float(positions_by_token.get(tok, 0.0))
-                                    max_shares = float(getattr(cfg, "max_position_shares", 500))
-                                    allowed_shares = max(0.0, max_shares - current_shares)
-                                    if allowed_shares <= 0.0:
-                                        logger.info(
-                                            "Position over cap: token=%s current=%.2f cap=%.2f — cancelling BUYs",
-                                            tok, current_shares, max_shares
-                                        )
-                                        # Cancel existing orders to ensure no additional BUY executions
-                                        try:
-                                            now_cancel = time.monotonic()
-                                            next_ok = overcap_cancel_until.get(tok, 0.0)
-                                            if now_cancel >= next_ok:
-                                                orders.cancel_market_orders(asset_id=tok)  # type: ignore[attr-defined]
-                                                # Space out subsequent cancels
-                                                overcap_cancel_until[tok] = now_cancel + float(getattr(cfg, "order_max_age_sec", 12))
-                                                logger.info("Cancelled open orders for over-cap token %s", tok)
-                                            else:
-                                                logger.debug("Over-cap cancel throttle active for %s", tok)
-                                        except Exception:
-                                            logger.warning("Failed to cancel open orders for over-cap token %s", tok)
-                                        continue
-                                    # Convert USD size to shares at bid price and clamp to allowed
-                                    intended_shares = float(sz) / float(bp) if float(bp) > 0 else 0.0
-                                    if intended_shares <= 0.0:
-                                        continue
-                                    if intended_shares > allowed_shares:
-                                        capped_sz = float(allowed_shares) * float(bp)
-                                        logger.debug(
-                                            "Capping BUY size for position limit: token=%s price=%.4f orig_sz=%.2f capped_sz=%.2f allowed_shares=%.2f",
-                                            tok, float(bp), float(sz), float(capped_sz), float(allowed_shares)
-                                        )
-                                        desired_sz = float(capped_sz)
-                                    else:
-                                        desired_sz = float(sz)
-                                    if desired_sz <= 0.0:
-                                        continue
-                                    desired_quotes.append(DesiredQuote(token_id=tok, side=Side.BUY, price=float(bp), size=float(desired_sz), level=idx))
-                                except Exception:
-                                    # If any error occurs during cap computation, fall back to original size
-                                    desired_quotes.append(DesiredQuote(token_id=tok, side=Side.BUY, price=float(bp), size=float(sz), level=idx))
+                                # If no remaining capacity considering open BUYs, stop placing new BUYs
+                                if shares_budget <= 0.0:
+                                    logger.debug("No BUY capacity remaining for token %s (budget=0)", tok)
+                                    break
+                                # Convert USD size to shares at bid price and clamp to remaining budget
+                                intended_shares = float(sz) / float(bp) if float(bp) > 0 else 0.0
+                                if intended_shares <= 0.0:
+                                    continue
+                                place_shares = min(intended_shares, shares_budget)
+                                desired_sz = float(place_shares) * float(bp)
+                                if desired_sz <= 0.0:
+                                    continue
+                                if place_shares < intended_shares:
+                                    logger.debug(
+                                        "Capping BUY due to remaining capacity: token=%s price=%.4f orig_shares=%.2f cap_shares=%.2f",
+                                        tok, float(bp), float(intended_shares), float(place_shares)
+                                    )
+                                desired_quotes.append(DesiredQuote(token_id=tok, side=Side.BUY, price=float(bp), size=float(desired_sz), level=idx))
+                                shares_budget -= place_shares
                     for idx, (ap, sz) in enumerate(zip(lq.ask_prices, lq.sizes)):
                         if sz > 0:
                             desired_quotes.append(DesiredQuote(token_id=tok, side=Side.SELL, price=float(ap), size=float(sz), level=idx))
