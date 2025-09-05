@@ -1,4 +1,5 @@
 import math
+import logging
 import random
 import time
 from dataclasses import dataclass
@@ -6,6 +7,8 @@ from typing import List, Optional
 
 from mm.market_data import OrderBook
 
+
+logger = logging.getLogger("mm.strategy")
 
 @dataclass
 class Quote:
@@ -67,6 +70,13 @@ class AvellanedaLite:
         delta_r = -self.inv_gamma * inventory_norm
         bid = max(0.01, min(0.99, fair + delta_r - h))
         ask = max(0.01, min(0.99, fair + delta_r + h))
+        try:
+            logger.debug(
+                "AvellanedaLite compute: fair=%.6f sigma=%.6f h=%.6f delta_r=%.6f inv_norm=%.6f bid=%.6f ask=%.6f",
+                float(fair), float(sigma), float(h), float(delta_r), float(inventory_norm), float(bid), float(ask)
+            )
+        except Exception:
+            pass
         return Quote(bid=bid, ask=ask)
 
     @staticmethod
@@ -108,6 +118,14 @@ def build_layered_quotes(
         bid_prices.append(bid)
         ask_prices.append(ask)
         sizes.append(size)
+    try:
+        logger.debug(
+            "LayeredQuotes: layers=%d tick=%.4f step=%d base_size=%.2f max_size=%.2f first_bid=%.4f first_ask=%.4f last_bid=%.4f last_ask=%.4f sizes=%s",
+            int(max(1, layers)), float(tick), int(step_ticks), float(base_size), float(max_size),
+            float(bid_prices[0]), float(ask_prices[0]), float(bid_prices[-1]), float(ask_prices[-1]), [round(s, 2) for s in sizes]
+        )
+    except Exception:
+        pass
     return LayeredQuotes(bid_prices=bid_prices, ask_prices=ask_prices, sizes=sizes, timestamp=time.time())
 
 

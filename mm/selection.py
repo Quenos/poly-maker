@@ -40,6 +40,29 @@ def normalize_selected_markets(df: pd.DataFrame) -> pd.DataFrame:
     for c in ["token1", "token2", "yes_token_id", "no_token_id", "condition_id"]:
         if c in df.columns:
             df[c] = df[c].astype(str)
+    # Normalize optional 'suspended' column to boolean (case-insensitive header with synonyms)
+    sus_col = None
+    try:
+        synonyms = {"suspended", "suspend", "suspend_buys", "pause_buys", "pause", "halt_buys"}
+        for c in df.columns:
+            if str(c).strip().lower() in synonyms:
+                sus_col = c
+                break
+    except Exception:
+        sus_col = None
+    
+    def _to_bool(x) -> bool:
+        try:
+            if isinstance(x, bool):
+                return x
+            s = str(x).strip().lower()
+            return s in ("true", "1", "yes", "y")
+        except Exception:
+            return False
+    if sus_col is not None:
+        df["suspended"] = df[sus_col].map(_to_bool).fillna(False)
+    else:
+        df["suspended"] = False
     return df.reset_index(drop=True)
 
 

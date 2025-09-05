@@ -76,6 +76,29 @@ def _fetch_nav_usd(address: str) -> float:
         return 0.0
 
 
+# Position value (excluding cash) via Data API
+def _fetch_positions_value_usd(address: str) -> float:
+    try:
+        url = f"https://data-api.polymarket.com/value?user={address}"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        body = resp.json()
+        # The API returns a dict with 'value' representing position value (per spec used here)
+        if isinstance(body, dict):
+            return float(body.get("value") or 0.0)
+        if isinstance(body, list) and body:
+            first = body[0]
+            if isinstance(first, dict) and "value" in first:
+                return float(first.get("value") or 0.0)
+            try:
+                return float(first)
+            except Exception:
+                return 0.0
+        return 0.0
+    except Exception:
+        logger.exception("Failed to fetch positions value for %s", address)
+        return 0.0
+
 # Direct on-chain USDC balance (cash only)
 def _fetch_usdc_balance(address: str) -> float:
     try:
@@ -185,6 +208,31 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
             if t1 and t2:
                 token_pairs.append((t1, t2))
 
+    # Track tokens where BUY placement is suspended by sheet flag
+    suspended_tokens: set[str] = set()
+    try:
+        if "suspended" in enriched.columns:
+            for _, row in enriched.iterrows():
+                try:
+                    is_susp = bool(row.get("suspended", False))
+                except Exception:
+                    is_susp = False
+                if is_susp:
+                    t1s = str(row.get("token1") or "").strip()
+                    t2s = str(row.get("token2") or "").strip()
+                    if t1s:
+                        suspended_tokens.add(t1s)
+                    if t2s:
+                        suspended_tokens.add(t2s)
+    except Exception:
+        logger.exception("Failed to parse suspended flags from sheet")
+
+    if suspended_tokens:
+        try:
+            logger.info("Sheet suspension active for %d tokens; will cancel existing buys and skip new BUY placements", len(suspended_tokens))
+        except Exception:
+            pass
+
     # Build token id list strictly from token1/token2
     token_ids: List[str] = list(initial_tokens)
 
@@ -251,6 +299,15 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
         requote_queue_levels=cfg.requote_queue_levels,
     )
 
+    # On startup, proactively cancel any existing orders on suspended tokens (clears BUYs immediately)
+    if suspended_tokens:
+        for tok in sorted(suspended_tokens):
+            try:
+                orders.cancel_market_orders(asset_id=tok)  # type: ignore[attr-defined]
+                logger.info("Cancelled existing orders for suspended token %s", tok)
+            except Exception:
+                logger.warning("Failed to cancel existing orders for suspended token %s", tok)
+
     # Strategy per YES token id
     strategies: Dict[str, AvellanedaLite] = {}
     for token in token_ids:
@@ -260,6 +317,25 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
             k_fee_ticks=cfg.k_fee_ticks,
             inv_gamma=cfg.inv_gamma,
         )
+    # Log strategy configuration parameters for analysis
+    try:
+        logger.debug(
+            "AvellanedaLite params: alpha_fair=%s k_vol=%s k_fee_ticks=%s inv_gamma=%s order_layers=%s base_size_usd=%s max_size_usd=%s price_tick=%s min_buy_price=%s max_position_shares=%s requote_mid_ticks=%s order_max_age_sec=%s",
+            getattr(cfg, "alpha_fair", None),
+            getattr(cfg, "k_vol", None),
+            getattr(cfg, "k_fee_ticks", None),
+            getattr(cfg, "inv_gamma", None),
+            getattr(cfg, "order_layers", None),
+            getattr(cfg, "base_size_usd", None),
+            getattr(cfg, "max_size_usd", None),
+            getattr(cfg, "price_tick", None),
+            getattr(cfg, "min_buy_price", None),
+            getattr(cfg, "max_position_shares", None),
+            getattr(cfg, "requote_mid_ticks", None),
+            getattr(cfg, "order_max_age_sec", None),
+        )
+    except Exception:
+        pass
 
     # Main loop: compute quotes and sync layered orders via engine
     last_quote_ts: Dict[str, float] = {}
@@ -287,12 +363,28 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
     # Selection supervisor (periodic re-pull) handled by existing SelectionManager instance
 
     async def selection_loop() -> None:
-        nonlocal token_ids, token_to_market, token_to_token1, token_pairs, strategies
-        logger.info("Selection loop started - checking for market changes every 15 minutes")
+        nonlocal token_ids, token_to_market, token_to_token1, token_pairs, strategies, suspended_tokens
+        try:
+            logger.info(
+                "Selection loop started - checking for market changes every %d seconds",
+                int(getattr(cfg, "selection_loop_sec", 300))
+            )
+        except Exception:
+            logger.info("Selection loop started - checking for market changes periodically")
         while not halt_event.is_set():
             try:
-                to_add, to_remove = await asyncio.to_thread(sel.tick)
+                # Single sheet read per cycle to honor SELECTION_LOOP_SEC
+                try:
+                    tokens_latest, enr = await asyncio.to_thread(sel.pull)
+                except Exception:
+                    tokens_latest, enr = (sel.active_tokens, enriched)
+                to_add, to_remove = sel.diff(tokens_latest)
                 if to_add or to_remove:
+                    # Snapshot updates active_tokens and timestamps
+                    try:
+                        sel.snapshot(tokens_latest)
+                    except Exception:
+                        pass
                     logger.info("🔄 MARKET SELECTION CHANGE DETECTED - Updating trading configuration")
                     logger.info("Previous active markets: %d", len(token_ids))
                     # Cancel orders for removed tokens before reconfiguring
@@ -305,11 +397,10 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                                 logger.warning("Failed to cancel orders for removed token %s", tok)
 
                     # Update tokens and subscriptions
-                    token_ids = sel.active_tokens
+                    token_ids = list(tokens_latest)
                     logger.info("New active markets: %d", len(token_ids))
                     
-                    # Re-enrich to capture latest condition ids
-                    _, enr = await asyncio.to_thread(sel.pull)
+                    # Use fresh enrichment to capture latest condition ids
                     old_market_count = len(token_to_market)
                     token_to_market.clear()
                     token_to_token1.clear()
@@ -333,9 +424,7 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                             if t1v and t2v:
                                 new_pairs.append((t1v, t2v))
                     token_pairs = new_pairs
-                    
                     logger.info("Market mappings: %d -> %d", old_market_count, len(token_to_market))
-                    
                     # Restart websocket subscriptions
                     logger.info("Restarting websocket subscriptions for %d tokens", len(token_ids))
                     _restart_ws(token_ids)
@@ -351,6 +440,25 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                                 inv_gamma=cfg.inv_gamma,
                             )
                             new_strategies += 1
+                    # Log current strategy params after selection changes
+                    try:
+                        logger.debug(
+                            "AvellanedaLite params (post-selection): alpha_fair=%s k_vol=%s k_fee_ticks=%s inv_gamma=%s order_layers=%s base_size_usd=%s max_size_usd=%s price_tick=%s min_buy_price=%s max_position_shares=%s requote_mid_ticks=%s order_max_age_sec=%s",
+                            getattr(cfg, "alpha_fair", None),
+                            getattr(cfg, "k_vol", None),
+                            getattr(cfg, "k_fee_ticks", None),
+                            getattr(cfg, "inv_gamma", None),
+                            getattr(cfg, "order_layers", None),
+                            getattr(cfg, "base_size_usd", None),
+                            getattr(cfg, "max_size_usd", None),
+                            getattr(cfg, "price_tick", None),
+                            getattr(cfg, "min_buy_price", None),
+                            getattr(cfg, "max_position_shares", None),
+                            getattr(cfg, "requote_mid_ticks", None),
+                            getattr(cfg, "order_max_age_sec", None),
+                        )
+                    except Exception:
+                        pass
                     # Prune strategies for removed tokens
                     removed_count = 0
                     for t in list(strategies.keys()):
@@ -368,15 +476,53 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                     logger.info("   - Active markets: %d", len(token_ids))
                     logger.info("   - Market mappings: %d", len(token_to_market))
                     logger.info("   - Trading strategies: %d", len(strategies))
+                # Recompute suspension on every tick from latest sheet enrichment
+                new_susp: set[str] = set()
+                try:
+                    if "suspended" in enr.columns:
+                        for _, row in enr.iterrows():
+                            try:
+                                is_susp2 = bool(row.get("suspended", False))
+                            except Exception:
+                                is_susp2 = False
+                            if is_susp2:
+                                t1v2 = str(row.get("token1") or "").strip() if "token1" in enr.columns else ""
+                                t2v2 = str(row.get("token2") or "").strip() if "token2" in enr.columns else ""
+                                if t1v2:
+                                    new_susp.add(t1v2)
+                                if t2v2:
+                                    new_susp.add(t2v2)
+                except Exception:
+                    logger.exception("Failed to recompute suspended set from sheet")
+                added_susp = sorted(list(new_susp - suspended_tokens))
+                removed_susp = sorted(list(suspended_tokens - new_susp))
+                suspended_tokens = new_susp
+                if added_susp:
+                    logger.info("Suspension ENABLED for %d tokens; cancelling existing orders and gating BUYs", len(added_susp))
+                    for tok in added_susp:
+                        try:
+                            orders.cancel_market_orders(asset_id=tok)  # type: ignore[attr-defined]
+                            logger.info("Cancelled existing orders for newly suspended token %s", tok)
+                        except Exception:
+                            logger.warning("Failed to cancel existing orders for suspended token %s", tok)
+                if removed_susp:
+                    logger.info("Suspension DISABLED for %d tokens; resuming BUY placements", len(removed_susp))
                 else:
-                    logger.debug("No market selection changes detected")
+                    logger.info("Selection tick complete: no selection changes detected; active markets=%d suspended=%d", len(token_ids), len(suspended_tokens))
                 
                 # Log periodic status hourly based on timestamp since last change
                 if (time.time() - sel.ts) > 3600:
                     logger.info("📊 Selection status: %d active markets, %d strategies, %d market mappings", 
                                len(token_ids), len(strategies), len(token_to_market))
                 
-                await asyncio.sleep(int(getattr(cfg, "selection_loop_sec", 900)))
+                # Re-read interval from Settings each cycle to allow runtime tuning without restart
+                try:
+                    from mm.sheet_config import load_config as _reload_cfg  # local import to avoid cycles
+                    new_cfg = _reload_cfg()
+                    sleep_sec = int(getattr(new_cfg, "selection_loop_sec", getattr(cfg, "selection_loop_sec", 300)))
+                except Exception:
+                    sleep_sec = int(getattr(cfg, "selection_loop_sec", 300))
+                await asyncio.sleep(max(1, sleep_sec))
             except Exception:
                 logger.exception("Selection loop error")
                 await asyncio.sleep(30)
@@ -423,26 +569,33 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
             # Standardize wallet source from config
             wallet = cfg.browser_address or ""
             if wallet:
-                positions_by_token, nav_usd = await asyncio.gather(
+                positions_by_token, pos_value_usd, cash_usdc = await asyncio.gather(
                     asyncio.to_thread(_fetch_positions_by_token, wallet),
-                    asyncio.to_thread(_fetch_nav_usd, wallet),
+                    asyncio.to_thread(_fetch_positions_value_usd, wallet),
+                    asyncio.to_thread(_fetch_usdc_balance, wallet),
                 )
+                total_bankroll_usd = float(max(0.0, pos_value_usd)) + float(max(0.0, cash_usdc))
             else:
                 positions_by_token = {}
-                nav_usd = 0.0
+                pos_value_usd = 0.0
+                cash_usdc = 0.0
+                total_bankroll_usd = 0.0
 
             # Heartbeat every 5s to confirm loop is alive
             try:
                 now_hb = time.monotonic()
                 if now_hb - _last_heartbeat >= float(getattr(cfg, "heartbeat_sec", 5)):
                     logger.debug("MM tick: tokens=%d books=%d", len(token_ids), len(md.books))
-                    # Heartbeat-level cash-only debug (on-chain USDC balance)
+                    # Heartbeat-level balances debug (reuse values fetched this tick)
                     try:
                         if wallet:
-                            cash_usdc = _fetch_usdc_balance(wallet)
-                            logger.debug("Cash (USDC) balance only: %.2f", cash_usdc)
+                            logger.debug(
+                                "Balances: cash_usdc=%.2f positions_value=%.2f total_bankroll=%.2f",
+                                float(cash_usdc),
+                                float(pos_value_usd),
+                                float(total_bankroll_usd),
+                            )
                     except Exception:
-                        # Errors are already logged inside _fetch_usdc_balance
                         pass
                     _last_heartbeat = now_hb
             except Exception:
@@ -481,6 +634,7 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                     continue
                 mid1 = float(mid1_val)
                 mid2 = float(min(0.99, max(0.01, 1.0 - mid1)))
+                # best bid/ask/mid logging already present elsewhere; avoid duplicates
                 last_fair_seen[t1] = mid1
                 if t2:
                     last_fair_seen[t2] = mid2
@@ -502,7 +656,7 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                         return
                     shares = positions_by_token.get(tok, 0.0)
                     inventory_usd = shares * fair_mid_val
-                    bankroll = nav_usd if nav_usd > 0 else 1.0
+                    bankroll = total_bankroll_usd if total_bankroll_usd > 0 else 1.0
                     inventory_norm = (inventory_usd / bankroll) if bankroll > 0 else 0.0
                     strat = strategies.get(tok) or AvellanedaLite(
                         alpha_fair=cfg.alpha_fair,
@@ -522,12 +676,12 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                             fair=fair_mid_val,
                             sigma=0.0,
                             inventory_usd=inventory_usd,
-                            bankroll_usd=nav_usd if nav_usd > 0 else 1.0,
+                            bankroll_usd=total_bankroll_usd if total_bankroll_usd > 0 else 1.0,
                             time_to_resolution_sec=24 * 3600.0,
                             tick=float(cfg.price_tick),
                         ),
                         token_id=tok,
-                        nav_usd=nav_usd,
+                        nav_usd=total_bankroll_usd,
                     )
                     try:
                         center0 = (float(quote.bid) + float(quote.ask)) / 2.0
@@ -566,9 +720,48 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                         cfg.order_layers,
                     )
                     # Build desired quotes for diffing engine
-                    for idx, (bp, sz) in enumerate(zip(lq.bid_prices, lq.sizes)):
-                        if sz > 0:
-                            desired_quotes.append(DesiredQuote(token_id=tok, side=Side.BUY, price=float(bp), size=float(sz), level=idx))
+                    if tok in suspended_tokens:
+                        logger.debug("BUYs suspended by sheet for token=%s; skipping BUY quotes", tok)
+                    else:
+                        for idx, (bp, sz) in enumerate(zip(lq.bid_prices, lq.sizes)):
+                            if sz > 0:
+                                # Safeguard: minimum buy price
+                                if float(bp) < float(getattr(cfg, "min_buy_price", 0.15)):
+                                    logger.debug(
+                                        "Skipping BUY below min_buy_price: token=%s price=%.4f min=%.4f",
+                                        tok, float(bp), float(getattr(cfg, "min_buy_price", 0.15))
+                                    )
+                                    continue
+                                # Position cap in shares (cap applies to long exposure growth)
+                                try:
+                                    current_shares = float(positions_by_token.get(tok, 0.0))
+                                    max_shares = float(getattr(cfg, "max_position_shares", 500))
+                                    allowed_shares = max(0.0, max_shares - current_shares)
+                                    if allowed_shares <= 0.0:
+                                        logger.debug(
+                                            "Skipping BUY due to position cap: token=%s current=%.2f cap=%.2f",
+                                            tok, current_shares, max_shares
+                                        )
+                                        continue
+                                    # Convert USD size to shares at bid price and clamp to allowed
+                                    intended_shares = float(sz) / float(bp) if float(bp) > 0 else 0.0
+                                    if intended_shares <= 0.0:
+                                        continue
+                                    if intended_shares > allowed_shares:
+                                        capped_sz = float(allowed_shares) * float(bp)
+                                        logger.debug(
+                                            "Capping BUY size for position limit: token=%s price=%.4f orig_sz=%.2f capped_sz=%.2f allowed_shares=%.2f",
+                                            tok, float(bp), float(sz), float(capped_sz), float(allowed_shares)
+                                        )
+                                        desired_sz = float(capped_sz)
+                                    else:
+                                        desired_sz = float(sz)
+                                    if desired_sz <= 0.0:
+                                        continue
+                                    desired_quotes.append(DesiredQuote(token_id=tok, side=Side.BUY, price=float(bp), size=float(desired_sz), level=idx))
+                                except Exception:
+                                    # If any error occurs during cap computation, fall back to original size
+                                    desired_quotes.append(DesiredQuote(token_id=tok, side=Side.BUY, price=float(bp), size=float(sz), level=idx))
                     for idx, (ap, sz) in enumerate(zip(lq.ask_prices, lq.sizes)):
                         if sz > 0:
                             desired_quotes.append(DesiredQuote(token_id=tok, side=Side.SELL, price=float(ap), size=float(sz), level=idx))
@@ -653,6 +846,7 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                 mid1 = float(min(0.99, max(0.01, mid1)))
                 # Token2 mid
                 mid2 = float(min(0.99, max(0.01, 1.0 - mid1)))
+                # best bid/ask/mid logging already present elsewhere; avoid duplicates
                 last_fair_seen[t1] = mid1
                 last_fair_seen[t2] = mid2
             await asyncio.sleep(1.0)
@@ -672,6 +866,16 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
             merge_task.cancel()
         except Exception:
             pass
+
+
+def start_market_maker(test_mode: bool = False, debug: bool = False) -> None:
+    """Blocking entrypoint to start the market maker from external scripts.
+
+    Args:
+        test_mode: If True, runs in dry-run mode without sending real orders.
+        debug: If True, enables DEBUG log level.
+    """
+    asyncio.run(main_async(test_mode=test_mode, debug_logging=debug))
 
 
 def main() -> None:

@@ -622,6 +622,17 @@ def get_positions(user=Depends(require_user)) -> Dict[str, Any]:
     try:
         pos_df = client.get_all_positions()
         logger.info(f"Fetched {len(pos_df) if pos_df is not None else 0} positions")
+        # Filter out dust/small positions with size exactly 0 or 1
+        if pos_df is not None and not pos_df.empty and "size" in pos_df.columns:
+            try:
+                pos_df["size"] = pd.to_numeric(pos_df["size"], errors="coerce")
+            except Exception:
+                pass
+            before_count = len(pos_df)
+            pos_df = pos_df[(pos_df["size"] != 0) & (pos_df["size"] != 1)].copy()
+            removed = before_count - len(pos_df)
+            if removed > 0:
+                logger.info(f"Filtered out {removed} positions with size 0 or 1")
         
         # Enrich with market name and outcome (API-first)
         if pos_df is not None and not pos_df.empty:

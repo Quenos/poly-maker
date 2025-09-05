@@ -43,6 +43,10 @@ class MMConfig:
     base_size_usd: float = 300.0
     max_size_usd: float = 1500.0
     price_tick: float = 0.01
+    # Safety guard: do not place BUY orders below this price
+    min_buy_price: float = 0.15
+    # Position cap in shares (not USD)
+    max_position_shares: int = 500
     requote_mid_ticks: int = 1
     requote_queue_levels: int = 2
     order_max_age_sec: int = 12
@@ -72,7 +76,7 @@ class MMConfig:
     log_rotation_backups: int = 5
 
     # Loop intervals
-    selection_loop_sec: int = 900
+    selection_loop_sec: int = 300
     heartbeat_sec: int = 5
     backfill_throttle_sec: int = 10
 
@@ -240,6 +244,8 @@ def load_config() -> MMConfig:
         base_size_usd=_get_float("BASE_SIZE_USD", 300.0, sheet_settings),
         max_size_usd=_get_float("MAX_SIZE_USD", 1500.0, sheet_settings),
         price_tick=_get_float("PRICE_TICK", 0.01, sheet_settings),
+        min_buy_price=_get_float("MIN_BUY_PRICE", 0.15, sheet_settings),
+        max_position_shares=_get_int("MAX_POSITION_SHARES", 500, sheet_settings),
         requote_mid_ticks=_get_int("REQUOTE_MID_TICKS", 1, sheet_settings),
         requote_queue_levels=_get_int("REQUOTE_QUEUE_LEVELS", 2, sheet_settings),
         order_max_age_sec=_get_int("ORDER_MAX_AGE_SEC", 12, sheet_settings),
@@ -268,7 +274,7 @@ def load_config() -> MMConfig:
         log_rotation_backups=_get_int("LOG_ROTATION_BACKUPS", 5, sheet_settings),
 
         # Loop intervals
-        selection_loop_sec=_get_int("SELECTION_LOOP_SEC", 900, sheet_settings),
+        selection_loop_sec=_get_int("SELECTION_LOOP_SEC", 300, sheet_settings),
         heartbeat_sec=_get_int("HEARTBEAT_SEC", 5, sheet_settings),
         backfill_throttle_sec=_get_int("BACKFILL_THROTTLE_SEC", 10, sheet_settings),
     )

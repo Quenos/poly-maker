@@ -159,12 +159,28 @@ def create_settings_sheet():
             'default': '0.01'
         },
         {
+            'setting_name': 'MIN_BUY_PRICE',
+            'value': '0.15',
+            'type': 'float',
+            'category': 'Order Management',
+            'description': 'Minimum allowed BUY price; bids below are skipped',
+            'default': '0.15'
+        },
+        {
             'setting_name': 'BASE_SIZE_USD',
             'value': '300.0',
             'type': 'float',
             'category': 'Order Management',
             'description': 'Base order size in USD',
             'default': '300.0'
+        },
+        {
+            'setting_name': 'MAX_POSITION_SHARES',
+            'value': '500',
+            'type': 'int',
+            'category': 'Order Management',
+            'description': 'Maximum allowed position in shares per token (cap)',
+            'default': '500'
         },
         {
             'setting_name': 'MAX_SIZE_USD',
@@ -319,11 +335,11 @@ def create_settings_sheet():
         # Loop intervals
         {
             'setting_name': 'SELECTION_LOOP_SEC',
-            'value': '900',
+            'value': '300',
             'type': 'int',
             'category': 'Loop Intervals',
             'description': 'Seconds between selection loop ticks',
-            'default': '900'
+            'default': '300'
         },
         {
             'setting_name': 'HEARTBEAT_SEC',
