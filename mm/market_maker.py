@@ -163,6 +163,14 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
         logging.getLogger().setLevel(final_level)
         # Apply same to key module loggers
         logging.getLogger("mm.market_data").setLevel(final_level)
+        # Log key risk/cap settings at startup for visibility
+        logger.info(
+            "Settings: max_position_shares=%s min_buy_price=%.2f order_layers=%d base_size_usd=%.2f",
+            str(getattr(cfg, "max_position_shares", None)),
+            float(getattr(cfg, "min_buy_price", 0.15)),
+            int(getattr(cfg, "order_layers", 3)),
+            float(getattr(cfg, "base_size_usd", 300.0)),
+        )
     except Exception:
         pass
     state = StateStore()
@@ -663,6 +671,23 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                         logger.debug("No orderbook for token=%s (market=%s)", tok, cid)
                         return
                     shares = positions_by_token.get(tok, 0.0)
+                    # Hard guard: if position already at/over cap, cancel and skip BUY building entirely
+                    try:
+                        max_shares_guard = float(getattr(cfg, "max_position_shares", 500))
+                        if float(shares) >= max_shares_guard:
+                            now_cancel = time.monotonic()
+                            next_ok = overcap_cancel_until.get(tok, 0.0)
+                            if now_cancel >= next_ok:
+                                try:
+                                    orders.cancel_market_orders(asset_id=tok)  # type: ignore[attr-defined]
+                                    overcap_cancel_until[tok] = now_cancel + float(getattr(cfg, "order_max_age_sec", 12))
+                                    logger.info("Position already over cap for %s (%.2f >= %.2f). Cancelled open orders.", tok, float(shares), max_shares_guard)
+                                except Exception:
+                                    logger.warning("Failed to cancel open orders for over-cap token %s", tok)
+                            else:
+                                logger.debug("Over-cap cancel throttle active for %s", tok)
+                    except Exception:
+                        pass
                     inventory_usd = shares * fair_mid_val
                     bankroll = total_bankroll_usd if total_bankroll_usd > 0 else 1.0
                     inventory_norm = (inventory_usd / bankroll) if bankroll > 0 else 0.0
