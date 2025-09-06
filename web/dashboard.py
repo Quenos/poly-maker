@@ -23,6 +23,10 @@ try:
     from poly_data.polymarket_client import PolymarketClient  # type: ignore
 except Exception as exc:
     raise RuntimeError("poly_data package not found in workspace") from exc
+try:
+    from poly_utils.google_utils import get_spreadsheet  # type: ignore
+except Exception:
+    get_spreadsheet = None  # type: ignore
 
 def _csv_env_set(name: str) -> set[str]:
     return set(x.strip() for x in (os.getenv(name, "") or "").split(",") if x.strip())
@@ -617,7 +621,7 @@ def get_positions_debug(user=Depends(require_user)) -> Dict[str, Any]:
 
 
 @app.get("/api/positions")
-def get_positions(user=Depends(require_user)) -> Dict[str, Any]:
+def get_positions(selected_only: Optional[bool] = False, user=Depends(require_user)) -> Dict[str, Any]:
     client = _ensure_client()
     try:
         pos_df = client.get_all_positions()
@@ -747,6 +751,48 @@ def get_positions(user=Depends(require_user)) -> Dict[str, Any]:
                 if mask.any():
                     logger.debug("Some market names still missing after API enrichment")
         
+        # If requested, filter to only positions whose market is listed in Selected Markets sheet
+        if selected_only and pos_df is not None and not pos_df.empty:
+            try:
+                selected_titles: set[str] = set()
+                if get_spreadsheet is not None:
+                    try:
+                        ss = get_spreadsheet(read_only=True)  # type: ignore[misc]
+                        wk = ss.worksheet("Selected Markets")
+                        sel_df = pd.DataFrame(wk.get_all_records())
+                    except Exception as exc:
+                        logger.info("Selected Markets sheet fetch failed: %s", str(exc))
+                        sel_df = pd.DataFrame()
+                else:
+                    sel_df = pd.DataFrame()
+
+                if not sel_df.empty:
+                    for col in ("question", "market", "title"):
+                        if col in sel_df.columns:
+                            selected_titles = set(str(x) for x in sel_df[col].astype(str).tolist())
+                            if selected_titles:
+                                break
+
+                # Ensure market_name available for comparison
+                if "market_name" not in pos_df.columns:
+                    pos_df["market_name"] = ""
+                # Use existing title if market_name still empty
+                if pos_df["market_name"].eq("").any() and "title" in pos_df.columns:
+                    pos_df.loc[pos_df["market_name"].eq("") & pos_df["title"].notna(), "market_name"] = (
+                        pos_df.loc[pos_df["market_name"].eq("") & pos_df["title"].notna(), "title"].astype(str)
+                    )
+
+                if selected_titles:
+                    before_n = len(pos_df)
+                    pos_df = pos_df[pos_df["market_name"].astype(str).isin(selected_titles)].copy()
+                    logger.info("Filtered positions by Selected Markets: %d -> %d", before_n, len(pos_df))
+                else:
+                    logger.info("Selected Markets sheet empty or unavailable; selected_only yields 0 rows")
+                    pos_df = pos_df.iloc[0:0]
+            except Exception as exc:
+                logger.info("selected_only filtering error: %s", str(exc))
+                pos_df = pos_df.iloc[0:0]
+
         wanted = ["market_name", "outcome", "size", "avgPrice", "curPrice", "percentPnl", "asset"]
         result = {"data": _df_to_records(pos_df, wanted)}
         logger.info(f"Returning {len(result['data'])} enriched positions")

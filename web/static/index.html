@@ -35,6 +35,9 @@
 
       <section>
         <h2>Positions</h2>
+        <div class="action-group" id="positions-filters">
+          <a href="#" id="toggle-selected-only" class="pill">Selected Only: Off</a>
+        </div>
         <table id="positions">
           <thead>
             <tr>
@@ -133,7 +136,8 @@
                   body: JSON.stringify(payload),
                 });
                 if (!res.ok) throw new Error('Close request failed');
-                await refresh();
+                await loadPositions();
+                await loadPnl();
               } catch (err) {
                 console.error(err);
               }
@@ -162,7 +166,7 @@
         if (disabled) btn.disabled = true;
         if (active) btn.className = 'active';
         if (!disabled && !active && typeof page === 'number') {
-          btn.addEventListener('click', () => { tradePage = page; refresh(); });
+          btn.addEventListener('click', () => { tradePage = page; loadTrades(); });
         }
         return btn;
       }
@@ -276,9 +280,12 @@
         }
       }
 
+      let selectedOnly = false;
+
       async function loadPositions() {
         try {
-          const positions = await fetchJson('api/positions');
+          const url = selectedOnly ? 'api/positions?selected_only=true' : 'api/positions';
+          const positions = await fetchJson(url);
           setPositionRows(
             document.querySelector('#positions-tbody'),
             positions.data || []
@@ -324,7 +331,6 @@
           } else {
             await loadTrades();
           }
-          await loadPnl();
           cycleIndex += 1;
         } catch (e) {
           console.error(e);
@@ -332,6 +338,22 @@
           isTicking = false;
         }
       }, 5000);
+
+      // PnL refresh every 60 seconds
+      setInterval(() => { loadPnl(); }, 60000);
+
+      // Positions filter toggle
+      document.addEventListener('DOMContentLoaded', () => {
+        const toggle = document.getElementById('toggle-selected-only');
+        if (toggle) {
+          toggle.addEventListener('click', async (e) => {
+            e.preventDefault();
+            selectedOnly = !selectedOnly;
+            toggle.textContent = `Selected Only: ${selectedOnly ? 'On' : 'Off'}`;
+            await loadPositions();
+          });
+        }
+      });
     </script>
   </body>
 </html>

@@ -770,8 +770,8 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                         tick=float(getattr(cfg, "price_tick", 0.01)),
                     )
                     strategies[tok] = strat
-                    # Drive strategy sigma/microprice off token1 orderbook consistently
-                    quote = strat.compute_quote(book1, inventory_norm, fair_hint=fair_mid_val, token_id=tok)
+                    # Drive strategy sigma/microprice off the token's own orderbook
+                    quote = strat.compute_quote(bookx, inventory_norm, fair_hint=fair_mid_val, token_id=tok)
                     if quote is None:
                         return
                     # Apply risk multipliers to pricing (spread and reservation price) before layering
@@ -847,11 +847,15 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                             no_prices.append(p)
                             tsize_no.append(shares * p)  # keep USD size for engine; log share calc
                     try:
+                        # Log mirrored NO prices (1-YES) and include SELL-YES ladder separately
+                        prices_yes_dbg = [round(x, 4) for x in yes_prices]
+                        prices_no_mirror_dbg = [max(0.01, min(0.99, round(1.0 - x, 4))) for x in yes_prices]
                         logger.debug(
                             "sizing_inputs: risk_budget=%.2f inv_usd=%.2f inv_norm=%.4f K_total=%.2f K_yes=%.2f K_no=%.2f prices_yes=%s prices_no=%s",
                             float(risk_budget), float(inventory_usd), float(I_norm), float(K_total), float(K_yes), float(K_no),
-                            [round(x, 4) for x in yes_prices], [round(x, 4) for x in no_prices]
+                            prices_yes_dbg, prices_no_mirror_dbg
                         )
+                        logger.debug("sizing_inputs_sell_yes: sell_yes_prices=%s", [round(x, 4) for x in no_prices])
                     except Exception:
                         pass
                     api_bid = bookx.best_bid()
