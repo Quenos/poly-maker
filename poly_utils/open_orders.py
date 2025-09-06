@@ -8,12 +8,13 @@ import requests
 
 
 def get_open_orders() -> None:
+    empty = pd.DataFrame()
     load_dotenv()
     pk = os.getenv("PK")
     funder = os.getenv("BROWSER_ADDRESS")
     if not pk or not funder:
         print("Missing PK or BROWSER_ADDRESS in environment")
-        return
+        return empty
 
     client = ClobClient("https://clob.polymarket.com", key=pk, chain_id=POLYGON, funder=funder)
     creds = client.create_or_derive_api_creds()
@@ -22,7 +23,7 @@ def get_open_orders() -> None:
     orders = client.get_orders()
     if not orders:
         print("No open orders.")
-        return
+        return empty
 
     df = pd.DataFrame(orders)
     # Show only active orders
@@ -30,7 +31,7 @@ def get_open_orders() -> None:
         df = df[df["status"].isin(["LIVE", "OPEN"])].copy()
         if df.empty:
             print("No open orders.")
-            return
+            return empty
     print(f"Fetched {len(df)} open orders")
     print(f"Order fields: {list(df.columns)}")
     # Fetch market metadata to map token_id/asset_id/market -> market name (robust to schema changes)
@@ -148,6 +149,10 @@ def get_open_orders() -> None:
 
 if __name__ == "__main__":
     df = get_open_orders()
+    if df is None or df.empty:
+        # get_open_orders already printed the status if applicable
+        import sys
+        sys.exit(0)
     # Pretty print
     cols = [
         "order_id",

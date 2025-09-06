@@ -30,6 +30,7 @@ class OrdersClient:
         creds = self.client.create_or_derive_api_creds()
         self.client.set_api_creds(creds=creds)
         self.state = state
+        self._logger = logging.getLogger("mm")
 
     @retry(
         stop=stop_after_attempt(3),
@@ -55,22 +56,46 @@ class OrdersClient:
                         timestamp=time.time(),
                     )
                 )
+            try:
+                self._logger.debug(
+                    "order_posted token=%s side=%s price=%.4f size=%.2f id=%s",
+                    str(token_id), side_str, float(price), float(size), order_id
+                )
+            except Exception:
+                pass
             return resp
         except PolyApiException as exc:
             # Detect insufficient allowance/balance and avoid retrying
             message = str(getattr(exc, "error_message", "") or str(exc)).lower()
+            try:
+                self._logger.warning(
+                    "order_error_nonretryable token=%s side=%s price=%.4f size=%.2f status=%s msg=%s",
+                    str(token_id), side_str, float(price), float(size),
+                    str(getattr(exc, "status_code", "")), str(getattr(exc, "error_message", exc))
+                )
+            except Exception:
+                pass
             if "not enough balance" in message or "not enough allowance" in message or "balance / allowance" in message:
                 raise NonRetryableOrderError(message)
             # Treat other PolyApiException as retryable
-            raise RetryableOrderError(str(exc))
+            raise RetryableOrderError(str(getattr(exc, "error_message", exc)))
         except Exception as exc:
             # Unknown/transient errors: retry
+            try:
+                self._logger.warning(
+                    "order_error_retryable token=%s side=%s price=%.4f size=%.2f err=%s",
+                    str(token_id), (side.value if isinstance(side, Side) else str(side).upper()), float(price), float(size), str(exc)
+                )
+            except Exception:
+                pass
             raise RetryableOrderError(str(exc))
 
-    def cancel_market_orders(self, market: Optional[str] = None, asset_id: Optional[str] = None) -> None:
+    def cancel_market_orders(self, market: Optional[str] = None, asset_id: Optional[str] = None, reason: Optional[str] = None) -> None:
         if market:
+            self._logger.info("cancel_orders: scope=market market=%s reason=%s", market, (reason or ""))
             self.client.cancel_market_orders(market=market)
         elif asset_id:
+            self._logger.info("cancel_orders: scope=asset asset_id=%s reason=%s", str(asset_id), (reason or ""))
             self.client.cancel_market_orders(asset_id=str(asset_id))
 
     def get_orders(self) -> List[dict]:
@@ -296,7 +321,7 @@ class OrdersEngine:
                 if idx < max_levels:
                     keep_ids.add(oid)
 
-        # Global requote trigger per token if mid shift large (still maintained for age/shift gating)
+        # Global requote trigger per token if mid shift >= 1 tick or bests changed (hysteresis)
         requote_tokens: set[str] = set()
         for token, mid in mid_by_token.items():
             if self._mid_shift_ticks(token, mid) >= self.requote_mid_ticks:

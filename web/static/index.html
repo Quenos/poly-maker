@@ -208,7 +208,7 @@
           const btn = document.createElement('button');
           btn.textContent = '<';
           if (ordersPage <= 1) btn.disabled = true;
-          if (!btn.disabled) btn.addEventListener('click', () => { ordersPage = ordersPage - 1; refresh(); });
+          if (!btn.disabled) btn.addEventListener('click', () => { ordersPage = ordersPage - 1; loadOrders(); });
           return btn;
         })());
 
@@ -234,7 +234,7 @@
             const btn = document.createElement('button');
             btn.textContent = String(p);
             if (p === ordersPage) btn.className = 'active';
-            if (p !== ordersPage) btn.addEventListener('click', () => { ordersPage = p; refresh(); });
+            if (p !== ordersPage) btn.addEventListener('click', () => { ordersPage = p; loadOrders(); });
             container.appendChild(btn);
           }
         }
@@ -244,41 +244,14 @@
           const btn = document.createElement('button');
           btn.textContent = '>';
           if (ordersPage >= totalPages) btn.disabled = true;
-          if (!btn.disabled) btn.addEventListener('click', () => { ordersPage = ordersPage + 1; refresh(); });
+          if (!btn.disabled) btn.addEventListener('click', () => { ordersPage = ordersPage + 1; loadOrders(); });
           return btn;
         })());
       }
 
-      async function refresh() {
+      async function loadPnl() {
         try {
-          const [ordRes, posRes, trRes, pnlRes] = await Promise.allSettled([
-            fetchJson(`api/orders?limit=${ordersPerPage}&page=${ordersPage}`),
-            fetchJson('api/positions'),
-            fetchJson(`api/trades?limit=${tradesPerPage}&page=${tradePage}`),
-            fetchJson('api/pnl'),
-          ]);
-
-          const orders = ordRes.status === 'fulfilled' ? ordRes.value : { data: [] };
-          const positions = posRes.status === 'fulfilled' ? posRes.value : { data: [] };
-          const trades = trRes.status === 'fulfilled' ? trRes.value : { data: [], total: 0 };
-          const pnl = pnlRes.status === 'fulfilled' ? pnlRes.value : { total: 0 };
-
-          setRows(document.querySelector('#orders tbody'), orders.data || [], [
-            'market_name', 'outcome', 'side', 'price', 'original_size', 'size_matched', 'status'
-          ]);
-          const totalOrderPages = orders.total ? Math.max(1, Math.ceil(orders.total / ordersPerPage)) : 1;
-          renderOrdersPagination(totalOrderPages);
-          setPositionRows(
-            document.querySelector('#positions-tbody'),
-            positions.data || []
-          );
-          setRows(document.querySelector('#trades tbody'), trades.data || [], [
-            'market_name', 'outcome', 'side', 'size', 'price', 'datetime'
-          ]);
-          const totalPages = trades.total ? Math.max(1, Math.ceil(trades.total / tradesPerPage)) : 1;
-          renderPagination(totalPages);
-
-          // Update header PnL pill
+          const pnl = await fetchJson('api/pnl');
           const pill = document.getElementById('total-pnl');
           const total = pnl && typeof pnl.total === 'number' ? pnl.total : 0;
           const sign = total > 0 ? '+' : '';
@@ -290,11 +263,75 @@
         }
       }
 
+      async function loadOrders() {
+        try {
+          const orders = await fetchJson(`api/orders?limit=${ordersPerPage}&page=${ordersPage}`);
+          setRows(document.querySelector('#orders tbody'), orders.data || [], [
+            'market_name', 'outcome', 'side', 'price', 'original_size', 'size_matched', 'status'
+          ]);
+          const totalOrderPages = orders.total ? Math.max(1, Math.ceil(orders.total / ordersPerPage)) : 1;
+          renderOrdersPagination(totalOrderPages);
+        } catch (e) {
+          console.error(e);
+        }
+      }
+
+      async function loadPositions() {
+        try {
+          const positions = await fetchJson('api/positions');
+          setPositionRows(
+            document.querySelector('#positions-tbody'),
+            positions.data || []
+          );
+        } catch (e) {
+          console.error(e);
+        }
+      }
+
+      async function loadTrades() {
+        try {
+          const trades = await fetchJson(`api/trades?limit=${tradesPerPage}&page=${tradePage}`);
+          setRows(document.querySelector('#trades tbody'), trades.data || [], [
+            'market_name', 'outcome', 'side', 'size', 'price', 'datetime'
+          ]);
+          const totalPages = trades.total ? Math.max(1, Math.ceil(trades.total / tradesPerPage)) : 1;
+          renderPagination(totalPages);
+        } catch (e) {
+          console.error(e);
+        }
+      }
+
       // Setup page
       document.addEventListener('DOMContentLoaded', () => {});
 
-      refresh();
-      setInterval(refresh, 5000);
+      // Initial load
+      loadOrders();
+      loadPositions();
+      loadTrades();
+      loadPnl();
+
+      // Rotate updates every 5s: orders -> positions -> trades -> repeat
+      let cycleIndex = 0;
+      let isTicking = false;
+      setInterval(async () => {
+        if (isTicking) return;
+        isTicking = true;
+        try {
+          if (cycleIndex % 3 === 0) {
+            await loadOrders();
+          } else if (cycleIndex % 3 === 1) {
+            await loadPositions();
+          } else {
+            await loadTrades();
+          }
+          await loadPnl();
+          cycleIndex += 1;
+        } catch (e) {
+          console.error(e);
+        } finally {
+          isTicking = false;
+        }
+      }, 5000);
     </script>
   </body>
 </html>

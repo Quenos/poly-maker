@@ -15,7 +15,7 @@ from mm.market_data import MarketData
 from mm.orders import OrdersClient, OrdersEngine, DesiredQuote, Side, SyncActions
 from mm.orders import NonRetryableOrderError
 from mm.state import StateStore
-from mm.strategy import AvellanedaLite, build_layered_quotes
+from mm.strategy import AvellanedaLite
 from mm.risk import RiskManager
 from mm.selection import SelectionManager
 from mm.merge_manager import MergeManager, MergeConfig
@@ -154,6 +154,13 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
     os.makedirs("logs", exist_ok=True)
     # We need cfg to get dynamic paths, but cfg loads after logging. Use defaults for bootstrap
     file_path = "logs/mm_main.log"
+    # Start fresh each run: truncate existing default log file
+    try:
+        if os.path.exists(file_path):
+            with open(file_path, "w", encoding="utf-8"):
+                pass
+    except Exception:
+        pass
     backups = 5
     fh = TimedRotatingFileHandler(file_path, when="midnight", backupCount=backups, encoding="utf-8")
     log_handlers.append(fh)
@@ -177,6 +184,13 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                 if isinstance(h, TimedRotatingFileHandler):
                     logging.getLogger().removeHandler(h)
                     log_handlers.remove(h)
+            # If log file path changed via config, truncate new file so each run starts fresh
+            try:
+                if os.path.exists(new_file):
+                    with open(new_file, "w", encoding="utf-8"):
+                        pass
+            except Exception:
+                pass
             fh2 = TimedRotatingFileHandler(new_file, when="midnight", backupCount=new_backups, encoding="utf-8")
             logging.getLogger().addHandler(fh2)
             log_handlers.append(fh2)
@@ -354,7 +368,7 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
     if suspended_tokens:
         for tok in sorted(suspended_tokens):
             try:
-                orders.cancel_market_orders(asset_id=tok)  # type: ignore[attr-defined]
+                orders.cancel_market_orders(asset_id=tok, reason="suspended")  # type: ignore[attr-defined]
                 logger.info("Cancelled existing orders for suspended token %s", tok)
             except Exception:
                 logger.warning("Failed to cancel existing orders for suspended token %s", tok)
@@ -367,6 +381,7 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
             k_vol=cfg.k_vol,
             k_fee_ticks=cfg.k_fee_ticks,
             inv_gamma=cfg.inv_gamma,
+            tick=float(getattr(cfg, "price_tick", 0.01)),
         )
     # Log strategy configuration parameters for analysis
     try:
@@ -444,7 +459,7 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                     if to_remove:
                         for tok in to_remove:
                             try:
-                                orders.cancel_market_orders(asset_id=tok)  # type: ignore[attr-defined]
+                                orders.cancel_market_orders(asset_id=tok, reason="removed_from_selection")  # type: ignore[attr-defined]
                                 logger.info("Cancelled orders for removed token %s", tok)
                             except Exception:
                                 logger.warning("Failed to cancel orders for removed token %s", tok)
@@ -491,6 +506,7 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                                 k_vol=cfg.k_vol,
                                 k_fee_ticks=cfg.k_fee_ticks,
                                 inv_gamma=cfg.inv_gamma,
+                                tick=float(getattr(cfg, "price_tick", 0.01)),
                             )
                             new_strategies += 1
                     # Log current strategy params after selection changes
@@ -554,7 +570,7 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                     logger.info("Suspension ENABLED for %d tokens; cancelling existing orders and gating BUYs", len(added_susp))
                     for tok in added_susp:
                         try:
-                            orders.cancel_market_orders(asset_id=tok)  # type: ignore[attr-defined]
+                            orders.cancel_market_orders(asset_id=tok, reason="suspension_enabled")  # type: ignore[attr-defined]
                             logger.info("Cancelled existing orders for newly suspended token %s", tok)
                         except Exception:
                             logger.warning("Failed to cancel existing orders for suspended token %s", tok)
@@ -729,7 +745,7 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                             next_ok = overcap_cancel_until.get(tok, 0.0)
                             if now_cancel >= next_ok:
                                 try:
-                                    orders.cancel_market_orders(asset_id=tok)  # type: ignore[attr-defined]
+                                    orders.cancel_market_orders(asset_id=tok, reason="position_over_cap")  # type: ignore[attr-defined]
                                     overcap_cancel_until[tok] = now_cancel + float(getattr(cfg, "order_max_age_sec", 12))
                                     logger.info("Position already over cap for %s (%.2f >= %.2f). Cancelled open orders.", tok, float(shares), max_shares_guard)
                                 except Exception:
@@ -738,18 +754,24 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                                 logger.debug("Over-cap cancel throttle active for %s", tok)
                     except Exception:
                         pass
-                    inventory_usd = shares * fair_mid_val
-                    bankroll = total_bankroll_usd if total_bankroll_usd > 0 else 1.0
-                    inventory_norm = (inventory_usd / bankroll) if bankroll > 0 else 0.0
+                    # Inventory in USD as payout exposure at resolution (YES only here)
+                    inventory_usd = float(shares) * 1.0
+                    # Use risk_budget_usd consistently for normalization
+                    try:
+                        risk_budget = float(getattr(cfg, "risk_budget_usd", 1000.0))
+                    except Exception:
+                        risk_budget = 1000.0
+                    inventory_norm = (inventory_usd / risk_budget) if risk_budget > 0 else 0.0
                     strat = strategies.get(tok) or AvellanedaLite(
                         alpha_fair=cfg.alpha_fair,
                         k_vol=cfg.k_vol,
                         k_fee_ticks=cfg.k_fee_ticks,
                         inv_gamma=cfg.inv_gamma,
+                        tick=float(getattr(cfg, "price_tick", 0.01)),
                     )
                     strategies[tok] = strat
                     # Drive strategy sigma/microprice off token1 orderbook consistently
-                    quote = strat.compute_quote(book1, inventory_norm, fair_hint=fair_mid_val)
+                    quote = strat.compute_quote(book1, inventory_norm, fair_hint=fair_mid_val, token_id=tok)
                     if quote is None:
                         return
                     # Apply risk multipliers to pricing (spread and reservation price) before layering
@@ -770,27 +792,68 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                         center0 = (float(quote.bid) + float(quote.ask)) / 2.0
                         delta_r0 = center0 - float(fair_mid_val)
                         h0 = max(0.0, (float(quote.ask) - float(quote.bid)) / 2.0)
+                        logger.debug(
+                            "risk_adjust_pre: fair=%.6f center=%.6f delta_r=%.6f h=%.6f gamma_mult=%.3f h_mult=%.3f",
+                            float(fair_mid_val), float(center0), float(delta_r0), float(h0), float(getattr(adj, "gamma_multiplier", 1.0)), float(getattr(adj, "h_multiplier", 1.0))
+                        )
                         delta_r1 = delta_r0 * float(adj.gamma_multiplier)
                         h1 = h0 * float(adj.h_multiplier)
                         new_bid = max(0.01, min(0.99, float(fair_mid_val) + delta_r1 - h1))
                         new_ask = max(0.01, min(0.99, float(fair_mid_val) + delta_r1 + h1))
+                        logger.debug(
+                            "risk_adjust_post: new_bid=%.6f new_ask=%.6f",
+                            float(new_bid), float(new_ask)
+                        )
                         quote = type(quote)(bid=float(new_bid), ask=float(new_ask))
                     except Exception:
                         pass
-                    lq = build_layered_quotes(
-                        base_quote=quote,
-                        layers=cfg.order_layers,
-                        base_size=cfg.base_size_usd,
-                        max_size=cfg.max_size_usd,
-                        tick=float(cfg.price_tick),
-                    )
-                    if adj.size_multiplier != 1.0:
-                        lq = type(lq)(
-                            bid_prices=lq.bid_prices,
-                            ask_prices=lq.ask_prices,
-                            sizes=[s * adj.size_multiplier for s in lq.sizes],
-                            timestamp=lq.timestamp,
+                    # Per-side USDC sizing with taper (balanced by inventory)
+                    # Normalize inventory by the same risk budget for sizing skew
+                    I_norm = 0.0
+                    try:
+                        if risk_budget > 0:
+                            I_norm = max(-1.0, min(1.0, float(inventory_usd) / float(risk_budget)))
+                    except Exception:
+                        I_norm = 0.0
+                    try:
+                        K_total = float(getattr(cfg, "per_reprice_usdc", getattr(cfg, "base_size_usd", 300.0)))
+                    except Exception:
+                        K_total = 300.0
+                    K_yes = 0.5 * K_total * (1.0 - I_norm)
+                    K_no = 0.5 * K_total * (1.0 + I_norm)
+                    taper = [0.40, 0.30, 0.20, 0.10]
+                    # Build price ladders around computed bid/ask
+                    yes_prices: list[float] = []
+                    no_prices: list[float] = []
+                    tsize_yes: list[float] = []
+                    tsize_no: list[float] = []
+                    tstep = float(getattr(cfg, "price_tick", 0.01))
+                    # YES (BUY) ladder below bid
+                    for i, w in enumerate(taper):
+                        p = round(max(0.01, min(0.99, float(quote.bid) - i * tstep)) / tstep) * tstep
+                        cap = w * K_yes
+                        if cap > 0 and p > 0:
+                            # BUY path: convert USD cap to YES shares
+                            shares = cap / p
+                            yes_prices.append(p)
+                            tsize_yes.append(shares * p)  # engine expects USD size; track both via logs
+                    # NO (SELL YES) ladder above ask
+                    for i, w in enumerate(taper):
+                        p = round(max(0.01, min(0.99, float(quote.ask) + i * tstep)) / tstep) * tstep
+                        cap = w * K_no
+                        if cap > 0 and p > 0:
+                            # SELL YES path: convert USD cap to YES shares for consistency
+                            shares = cap / p
+                            no_prices.append(p)
+                            tsize_no.append(shares * p)  # keep USD size for engine; log share calc
+                    try:
+                        logger.debug(
+                            "sizing_inputs: risk_budget=%.2f inv_usd=%.2f inv_norm=%.4f K_total=%.2f K_yes=%.2f K_no=%.2f prices_yes=%s prices_no=%s",
+                            float(risk_budget), float(inventory_usd), float(I_norm), float(K_total), float(K_yes), float(K_no),
+                            [round(x, 4) for x in yes_prices], [round(x, 4) for x in no_prices]
                         )
+                    except Exception:
+                        pass
                     api_bid = bookx.best_bid()
                     api_ask = bookx.best_ask()
                     logger.debug(
@@ -856,7 +919,7 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                                 now_cancel = time.monotonic()
                                 next_ok = overcap_cancel_until.get(tok, 0.0)
                                 if now_cancel >= next_ok:
-                                    orders.cancel_market_orders(asset_id=tok)  # type: ignore[attr-defined]
+                                    orders.cancel_market_orders(asset_id=tok, reason="no_buy_capacity")  # type: ignore[attr-defined]
                                     overcap_cancel_until[tok] = now_cancel + float(getattr(cfg, "order_max_age_sec", 12))
                                     logger.info(
                                         "No BUY capacity (cap=%s, pos=%.2f, open_buys=%.2f). Cancelled open orders for %s",
@@ -866,13 +929,56 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                                     logger.debug("No BUY capacity for %s; cancel throttle active", tok)
                             except Exception:
                                 logger.warning("Failed to cancel open orders for %s when capacity is 0", tok)
-                        for idx, (bp, sz) in enumerate(zip(lq.bid_prices, lq.sizes)):
-                            if sz > 0:
+                        # Minimum per-order notional in USD (exchange enforces >= 5)
+                        try:
+                            min_order_usd = float(getattr(cfg, "min_order_usd", 5.0))
+                        except Exception:
+                            min_order_usd = 5.0
+                        # Parity bounds using opposite token bests (if available)
+                        try:
+                            other_tok = None
+                            for a, b in token_pairs:
+                                if a == tok:
+                                    other_tok = b
+                                    break
+                                if b == tok:
+                                    other_tok = a
+                                    break
+                            other_book = md.books.get(other_tok) if other_tok else None
+                            other_bb = float(other_book.best_bid()) if (other_book and other_book.best_bid() is not None) else None
+                            other_ba = float(other_book.best_ask()) if (other_book and other_book.best_ask() is not None) else None
+                        except Exception:
+                            other_bb = None
+                            other_ba = None
+                        for idx, (bp, usd_cap) in enumerate(zip(yes_prices, tsize_yes)):
+                            if usd_cap > 0:
+                                # Apply parity cap for YES bid: bid <= 1 - other_bb - tick
+                                bp_eff = bp
+                                try:
+                                    if other_bb is not None:
+                                        bp_eff = min(bp_eff, max(0.01, min(0.99, 1.0 - other_bb - tstep)))
+                                    # Add one extra tick for profit versus current best bid (stay one tick below)
+                                    if api_bid is not None:
+                                        bp_eff = min(bp_eff, max(0.01, min(0.99, float(api_bid) - tstep)))
+                                    # Round to tick after bounds
+                                    bp_eff = max(0.01, min(0.99, round(bp_eff / tstep) * tstep))
+                                except Exception:
+                                    pass
+                                # Enforce minimum notional
+                                if float(usd_cap) < float(min_order_usd):
+                                    try:
+                                        logger.debug(
+                                            "skip_buy_below_min_usd: token=%s lvl=%d price=%.4f usd_cap=%.2f min_usd=%.2f",
+                                            tok, int(idx), float(bp_eff), float(usd_cap), float(min_order_usd)
+                                        )
+                                    except Exception:
+                                        pass
+                                    continue
                                 # Safeguard: minimum buy price
-                                if float(bp) < float(getattr(cfg, "min_buy_price", 0.15)):
+                                if float(bp_eff) < float(getattr(cfg, "min_buy_price", 0.15)):
                                     logger.debug(
                                         "Skipping BUY below min_buy_price: token=%s price=%.4f min=%.4f",
-                                        tok, float(bp), float(getattr(cfg, "min_buy_price", 0.15))
+                                        tok, float(bp_eff), float(getattr(cfg, "min_buy_price", 0.15))
                                     )
                                     continue
                                 # If no remaining capacity considering open BUYs, stop placing new BUYs
@@ -880,23 +986,123 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                                     logger.debug("No BUY capacity remaining for token %s (budget=0)", tok)
                                     break
                                 # Convert USD size to shares at bid price and clamp to remaining budget
-                                intended_shares = float(sz) / float(bp) if float(bp) > 0 else 0.0
+                                intended_shares = float(usd_cap) / float(bp_eff) if float(bp_eff) > 0 else 0.0
                                 if intended_shares <= 0.0:
                                     continue
                                 place_shares = min(intended_shares, shares_budget)
-                                desired_sz = float(place_shares) * float(bp)
+                                desired_sz = float(place_shares) * float(bp_eff)
+                                # Enforce minimum notional after clamping by capacity
+                                if desired_sz < float(min_order_usd):
+                                    try:
+                                        logger.debug(
+                                            "skip_buy_after_cap_below_min_usd: token=%s lvl=%d price=%.4f desired_usd=%.2f min_usd=%.2f",
+                                            tok, int(idx), float(bp_eff), float(desired_sz), float(min_order_usd)
+                                        )
+                                    except Exception:
+                                        pass
+                                    continue
                                 if desired_sz <= 0.0:
                                     continue
                                 if place_shares < intended_shares:
                                     logger.debug(
                                         "Capping BUY due to remaining capacity: token=%s price=%.4f orig_shares=%.2f cap_shares=%.2f",
-                                        tok, float(bp), float(intended_shares), float(place_shares)
+                                        tok, float(bp_eff), float(intended_shares), float(place_shares)
                                     )
-                                desired_quotes.append(DesiredQuote(token_id=tok, side=Side.BUY, price=float(bp), size=float(desired_sz), level=idx))
+                                desired_quotes.append(DesiredQuote(token_id=tok, side=Side.BUY, price=float(bp_eff), size=float(desired_sz), level=idx))
                                 shares_budget -= place_shares
-                    for idx, (ap, sz) in enumerate(zip(lq.ask_prices, lq.sizes)):
-                        if sz > 0:
-                            desired_quotes.append(DesiredQuote(token_id=tok, side=Side.SELL, price=float(ap), size=float(sz), level=idx))
+                                try:
+                                    logger.debug(
+                                        "place_plan_buy: token=%s lvl=%d price=%.4f usd_cap=%.2f shares=%.4f desired_usd=%.2f rem_shares_cap=%.2f",
+                                        tok, int(idx), float(bp_eff), float(usd_cap), float(place_shares), float(desired_sz), float(shares_budget)
+                                    )
+                                except Exception:
+                                    pass
+                    # Compute SELL capacity based on current holdings minus open SELLs
+                    open_sell_shares = 0.0
+                    try:
+                        for o in live_orders_all:
+                            try:
+                                o_tok = str(o.get("asset_id") or o.get("token_id") or o.get("market") or "")
+                                o_side = str(o.get("side") or o.get("action") or o.get("order_side") or "").upper()
+                                if o_tok != tok or o_side != "SELL":
+                                    continue
+                                o_price = float(o.get("price") or 0.0)
+                                size_rem = None
+                                try:
+                                    orig = float(o.get("original_size") or 0.0)
+                                    filled = float(o.get("size_matched") or 0.0)
+                                    rem = max(0.0, orig - filled)
+                                    size_rem = rem if rem > 0.0 else None
+                                except Exception:
+                                    size_rem = None
+                                if size_rem is None:
+                                    size_rem = float(o.get("size") or o.get("remaining_size") or 0.0)
+                                # Convert USD to shares using order price
+                                if o_price > 0.0 and size_rem > 0.0:
+                                    open_sell_shares += (size_rem / o_price)
+                            except Exception:
+                                continue
+                    except Exception:
+                        open_sell_shares = 0.0
+                    sell_shares_budget = max(0.0, float(positions_by_token.get(tok, 0.0)) - open_sell_shares)
+                    for idx, (ap, usd_cap) in enumerate(zip(no_prices, tsize_no)):
+                        if usd_cap > 0 and sell_shares_budget > 0.0:
+                            # Enforce minimum notional for SELL before conversion
+                            if float(usd_cap) < float(min_order_usd):
+                                try:
+                                    logger.debug(
+                                        "skip_sell_below_min_usd: token=%s lvl=%d price=%.4f usd_cap=%.2f min_usd=%.2f",
+                                        tok, int(idx), float(ap), float(usd_cap), float(min_order_usd)
+                                    )
+                                except Exception:
+                                    pass
+                                continue
+                            # SELL YES parity bounds using other bests
+                            ap_eff = ap
+                            try:
+                                if other_ba is not None:
+                                    lower_bound = max(0.01, min(0.99, 1.0 - other_ba + tstep))
+                                    ap_eff = max(ap_eff, lower_bound)
+                                if other_bb is not None:
+                                    upper_bound = max(0.01, min(0.99, 1.0 - other_bb - tstep))
+                                    ap_eff = min(ap_eff, upper_bound)
+                                # Add one extra tick for profit versus current best ask (stay one tick above)
+                                if api_ask is not None:
+                                    ap_eff = max(ap_eff, max(0.01, min(0.99, float(api_ask) + tstep)))
+                                # Round to tick after bounds
+                                ap_eff = max(0.01, min(0.99, round(ap_eff / tstep) * tstep))
+                            except Exception:
+                                pass
+                            # SELL YES: gate by available shares; convert USD cap to shares and clamp
+                            try:
+                                assert float(ap_eff) > 0
+                                intended_shares = float(usd_cap) / float(ap_eff)
+                            except Exception:
+                                intended_shares = 0.0
+                            if intended_shares <= 0.0:
+                                continue
+                            place_shares = min(intended_shares, sell_shares_budget)
+                            desired_usd = float(place_shares) * float(ap_eff)
+                            if desired_usd < float(min_order_usd):
+                                try:
+                                    logger.debug(
+                                        "skip_sell_after_cap_below_min_usd: token=%s lvl=%d price=%.4f desired_usd=%.2f min_usd=%.2f",
+                                        tok, int(idx), float(ap_eff), float(desired_usd), float(min_order_usd)
+                                    )
+                                except Exception:
+                                    pass
+                                continue
+                            if desired_usd <= 0.0:
+                                continue
+                            desired_quotes.append(DesiredQuote(token_id=tok, side=Side.SELL, price=float(ap_eff), size=float(desired_usd), level=idx))
+                            sell_shares_budget -= place_shares
+                            try:
+                                logger.debug(
+                                    "place_plan_sell: token=%s lvl=%d price=%.4f usd_cap=%.2f shares=%.4f desired_usd=%.2f rem_sell_shares=%.2f",
+                                    tok, int(idx), float(ap_eff), float(usd_cap), float(place_shares), float(desired_usd), float(sell_shares_budget)
+                                )
+                            except Exception:
+                                pass
                     mid_by_token[tok] = float(fair_mid_val)
 
                 _quote_token(t1, mid1)
