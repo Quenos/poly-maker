@@ -1,6 +1,7 @@
 import random
 import time
 from dataclasses import dataclass
+import logging
 from enum import Enum
 from typing import List, Optional, Union
 
@@ -168,6 +169,7 @@ class OrdersEngine:
         self._created_ts: dict[str, float] = {}
         self._price_level_idx: dict[str, int] = {}  # order_id -> level
         self._last_mid: dict[str, float] = {}  # token -> last seen mid used for placement
+        self._logger = logging.getLogger("mm.orders")
 
     def _now(self) -> float:
         return time.time()
@@ -258,6 +260,22 @@ class OrdersEngine:
                     price = 0.0
                 return _depth(side, price, mid)
             lst.sort(key=sort_key)
+        # Log overflow of live orders beyond desired layers (stale depth exposure)
+        for key, live_list in live_by_ts.items():
+            tok, side = key
+            desired_list = desired_by_ts.get(key, [])
+            desired_layers = max(1, len(desired_list)) if desired_list else 0
+            if desired_layers >= 0 and len(live_list) > desired_layers:
+                try:
+                    self._logger.warning(
+                        "excess_live_orders token=%s side=%s live=%d desired_layers=%d",
+                        tok,
+                        side,
+                        len(live_list),
+                        desired_layers,
+                    )
+                except Exception:
+                    pass
         
         # Determine which existing live orders to keep: top-N (layers) by closeness to mid per side
         keep_ids: set[str] = set()
@@ -305,8 +323,7 @@ class OrdersEngine:
                 current_price = float(o.get("price", 0.0))
             except Exception:
                 current_price = 0.0
-            current_depth = _depth(dq.side, current_price, float(mid))
-            desired_depth = _depth(dq.side, dq.price, float(mid))
+            # depth improvement can be evaluated if needed; omitted to reduce churn
             price_changed = abs(current_price - dq.price) >= max(self.tick, 1e-6)
             # Capacity for this side
             side_key2 = dq.side.value if isinstance(dq.side, Side) else str(dq.side).upper()
@@ -370,5 +387,16 @@ class OrdersEngine:
                     actions.errors.append(OrderActionError(token=dq.token_id, side=dq.side, price=dq.price, size=dq.size, type="unknown", error=str(exc)))
 
         # Do NOT cancel existing closer orders when deeper desired appear; skip mass cancellations
+        try:
+            # Per-sync summary (use DEBUG to avoid noise)
+            self._logger.debug(
+                "sync_summary placed=%d replaced=%d cancelled=%d errors=%d",
+                len(actions.placed),
+                len(actions.replaced),
+                len(actions.cancelled),
+                len(actions.errors),
+            )
+        except Exception:
+            pass
 
         return actions

@@ -284,6 +284,11 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
 
     def _restart_ws(tokens: List[str]) -> None:
         nonlocal ws_task
+        # Mark a cold-start/backfill window annotation for diagnostics
+        try:
+            logger.info("coldstart_window begin: tokens=%d", len(tokens))
+        except Exception:
+            pass
         if ws_task is not None:
             try:
                 ws_task.cancel()
@@ -306,6 +311,10 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
             ws_task = asyncio.create_task(_ws_runner(tokens))
         else:
             logger.warning("No token_ids derived; skipping WS subscription")
+        try:
+            logger.info("coldstart_window end: tokens=%d", len(tokens))
+        except Exception:
+            pass
 
     _restart_ws(token_ids)
 
@@ -900,6 +909,14 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                         actions = SyncActions(placed=[], cancelled=[], replaced=[], errors=[])
                     else:
                         actions = engine.sync(desired_quotes, mid_by_token)
+                    # Churn summary per loop
+                    try:
+                        logger.info(
+                            "churn_summary placed=%d replaced=%d cancelled=%d errors=%d",
+                            len(actions.placed), len(actions.replaced), len(actions.cancelled), len(actions.errors)
+                        )
+                    except Exception:
+                        pass
                     # Aggregate placed USD by side for diagnostics
                     placed = actions.placed + actions.replaced
                     buy_usd = 0.0
@@ -969,6 +986,19 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                 mid1 = float(min(0.99, max(0.01, mid1)))
                 # Token2 mid
                 mid2 = float(min(0.99, max(0.01, 1.0 - mid1)))
+                # Token2 parity divergence diagnostic if token2 book exists
+                try:
+                    b2 = md.books.get(t2).best_bid() if (t2 and md.books.get(t2)) else None  # type: ignore[union-attr]
+                    a2 = md.books.get(t2).best_ask() if (t2 and md.books.get(t2)) else None  # type: ignore[union-attr]
+                    if b2 is not None and a2 is not None:
+                        mid2_ob = (float(b2) + float(a2)) / 2.0
+                        if abs(mid2_ob - mid2) >= float(getattr(cfg, "price_tick", 0.01)):
+                            logger.warning(
+                                "token2_parity_divergence market=%s t1=%s t2=%s mid1=%.4f mirrored_mid2=%.4f ob_mid2=%.4f diff=%.4f",
+                                cid, t1, (t2 or ""), mid1, mid2, mid2_ob, abs(mid2_ob - mid2)
+                            )
+                except Exception:
+                    pass
                 # best bid/ask/mid logging already present elsewhere; avoid duplicates
                 last_fair_seen[t1] = mid1
                 last_fair_seen[t2] = mid2
