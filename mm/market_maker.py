@@ -23,6 +23,7 @@ from mm.merge_manager import MergeManager, MergeConfig
 from web3 import Web3
 from poly_data.abis import erc20_abi
 from poly_data.polymarket_client import PolymarketClient
+from wallet_pnl import fetch_activity_trades  # type: ignore
 
 logger = logging.getLogger("mm")
 
@@ -419,6 +420,33 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
     freeze_until: Dict[str, float] = {}
     backoff_state: Dict[str, dict] = {}
 
+    # Helper to persist asset mappings using selection enrichment (token->market name/outcome)
+    token_meta_cache: Dict[str, tuple[str, str, str]] = {}
+    try:
+        # Build initial mappings from `enriched` selection dataframe if present
+        if 'token1' in enriched.columns or 'token2' in enriched.columns:
+            for _, row in enriched.iterrows():
+                market_name = str(row.get('question') or row.get('title') or row.get('name') or '')
+                market_id = str(row.get('condition_id') or row.get('conditionId') or '')
+                t1 = str(row.get('token1') or '')
+                t2 = str(row.get('token2') or '')
+                o1 = str(row.get('answer1') or row.get('outcome1') or 'YES') if t1 else ''
+                o2 = str(row.get('answer2') or row.get('outcome2') or 'NO') if t2 else ''
+                if t1:
+                    token_meta_cache[t1] = (market_id, market_name, o1)
+                    try:
+                        state.upsert_asset_mapping(t1, market_id, market_name, o1)
+                    except Exception:
+                        pass
+                if t2:
+                    token_meta_cache[t2] = (market_id, market_name, o2)
+                    try:
+                        state.upsert_asset_mapping(t2, market_id, market_name, o2)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
     def _compute_mid(best_bid: float | None, best_ask: float | None, tick: float = 0.01) -> float | None:
         if best_bid is None and best_ask is None:
             return None
@@ -637,6 +665,85 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
         str(bool(cfg.merge_dry_run)),
     )
     merge_task = asyncio.create_task(merge_mgr.run_loop(cfg.browser_address))
+
+    # Background: ingest fills via Data-API activity for our wallet and persist to DB
+    async def fills_ingest_loop() -> None:
+        last_ts_seen: float = 0.0
+        poll_sec = 10
+        wallet_addr = (cfg.browser_address or "").strip()
+        if not wallet_addr:
+            return
+        logger.info("Starting fills ingestion loop for wallet %s", wallet_addr)
+        while not halt_event.is_set():
+            try:
+                import pandas as pd  # local import
+                df = await asyncio.to_thread(fetch_activity_trades, wallet_addr, 200)
+                if df is not None and not df.empty:
+                    # Normalize expected columns
+                    token_col = None
+                    for c in ("asset", "token_id", "tokenId", "asset_id"):
+                        if c in df.columns:
+                            token_col = c
+                            break
+                    if token_col is None:
+                        await asyncio.sleep(poll_sec)
+                        continue
+                    # Filter by timestamp > last_ts_seen if available
+                    ts_col = None
+                    for c in ("timestamp", "ts", "created_at", "createdAt"):
+                        if c in df.columns:
+                            ts_col = c
+                            break
+                    rows = df
+                    if ts_col is not None:
+                        try:
+                            rows = df[pd.to_numeric(df[ts_col], errors="coerce").fillna(0).astype(float) > last_ts_seen]
+                        except Exception:
+                            pass
+                    for _, r in rows.iterrows():
+                        try:
+                            tok = str(r.get(token_col) or "").strip()
+                            if not tok:
+                                continue
+                            side = str(r.get("side") or "").upper()
+                            price = float(r.get("price") or 0.0)
+                            size = float(r.get("size") or 0.0)
+                            ts_v = float(r.get(ts_col) or 0.0) if ts_col is not None else time.time()
+                            if ts_v > last_ts_seen:
+                                last_ts_seen = ts_v
+                            # Prefer provided id if present
+                            fill_id = str(r.get("id") or f"{tok}|{int(ts_v)}|{side}|{price:.6f}|{size:.6f}")
+                            state.record_fill(fill_id=fill_id, token_id=tok, side=side, px=price, qty=size, fee=0.0, ts=ts_v)
+                            # Upsert asset mapping if known from selection cache
+                            mid = token_to_market.get(tok) or ""
+                            mk_name = ""
+                            outcome = ""
+                            try:
+                                if tok in token_meta_cache:
+                                    mid, mk_name, outcome = token_meta_cache.get(tok, (mid, "", ""))
+                                else:
+                                    # fallback try via enriched df
+                                    if mid and ('condition_id' in enriched.columns or 'conditionId' in enriched.columns):
+                                        cond_col = 'condition_id' if 'condition_id' in enriched.columns else 'conditionId'
+                                        rows_m = enriched[enriched[cond_col].astype(str) == str(mid)]
+                                        if not rows_m.empty:
+                                            rr0 = rows_m.iloc[0]
+                                            mk_name = str(rr0.get('question') or rr0.get('title') or rr0.get('name') or '')
+                                            if str(rr0.get('token1') or '') == tok:
+                                                outcome = str(rr0.get('answer1') or rr0.get('outcome1') or 'YES')
+                                            elif str(rr0.get('token2') or '') == tok:
+                                                outcome = str(rr0.get('answer2') or rr0.get('outcome2') or 'NO')
+                                state.upsert_asset_mapping(tok, mid, mk_name, outcome)
+                            except Exception:
+                                pass
+                        except Exception:
+                            continue
+                await asyncio.sleep(poll_sec)
+            except Exception:
+                logger.exception("fills_ingest_loop error")
+                await asyncio.sleep(30)
+
+    fills_task = asyncio.create_task(fills_ingest_loop())
     try:
         while True:
             # Pull live positions and NAV for inventory-aware quoting
@@ -1282,6 +1389,35 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                     for tok, m in mid_by_token.items():
                         last_quote_ts[tok] = time.time()
                         last_mid_seen[tok] = m
+                    # Persist asset mappings for any tokens we touched this cycle
+                    try:
+                        for tok in mid_by_token.keys():
+                            if tok in token_meta_cache:
+                                continue
+                            # Attempt to infer mapping via token_to_market and enriched df
+                            mid = token_to_market.get(tok) or ''
+                            mk_name = ''
+                            outcome = ''
+                            try:
+                                if mid and ('condition_id' in enriched.columns or 'conditionId' in enriched.columns):
+                                    cond_col = 'condition_id' if 'condition_id' in enriched.columns else 'conditionId'
+                                    rows = enriched[enriched[cond_col].astype(str) == str(mid)]
+                                    if not rows.empty:
+                                        r0 = rows.iloc[0]
+                                        mk_name = str(r0.get('question') or r0.get('title') or r0.get('name') or '')
+                                        if str(r0.get('token1') or '') == tok:
+                                            outcome = str(r0.get('answer1') or r0.get('outcome1') or 'YES')
+                                        elif str(r0.get('token2') or '') == tok:
+                                            outcome = str(r0.get('answer2') or r0.get('outcome2') or 'NO')
+                            except Exception:
+                                pass
+                            token_meta_cache[tok] = (mid, mk_name, outcome)
+                            try:
+                                state.upsert_asset_mapping(tok, mid, mk_name, outcome)
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
                 except NonRetryableOrderError as nre:
                     logger.warning("Non-retryable order error: %s", nre)
                     # Apply cooldown/backoff for all tokens we attempted to quote this cycle
@@ -1345,6 +1481,10 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                 pass
         try:
             merge_task.cancel()
+        except Exception:
+            pass
+        try:
+            fills_task.cancel()
         except Exception:
             pass
 

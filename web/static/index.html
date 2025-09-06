@@ -317,11 +317,15 @@
       loadTrades();
       loadPnl();
 
-      // Rotate updates every 5s: orders -> positions -> trades -> repeat
+      // Rotate updates every 5s (no jitter): orders -> positions -> trades -> repeat
       let cycleIndex = 0;
       let isTicking = false;
-      setInterval(async () => {
-        if (isTicking) return;
+      function scheduleRotationTick(initialDelayMs) {
+        const base = typeof initialDelayMs === 'number' ? initialDelayMs : 5000;
+        setTimeout(rotationTick, base);
+      }
+      async function rotationTick() {
+        if (isTicking) { scheduleRotationTick(); return; }
         isTicking = true;
         try {
           if (cycleIndex % 3 === 0) {
@@ -336,11 +340,31 @@
           console.error(e);
         } finally {
           isTicking = false;
+          scheduleRotationTick();
         }
-      }, 5000);
+      }
+      // Start 2.5s late to de-sync the 15s cycles from the 5s loop
+      scheduleRotationTick(2500);
 
-      // Trades refresh every 5 seconds (independent of rotation)
-      setInterval(() => { loadTrades(); }, 5000);
+      // Trades refresh every ~5 seconds (independent of rotation) with ±0.2s jitter
+      let isTradesRefreshTicking = false;
+      function scheduleTradesRefreshTick() {
+        const jitterMs = (Math.random() * 0.4 - 0.2) * 1000; // ±200ms
+        setTimeout(tradesRefreshTick, 5000 + jitterMs);
+      }
+      async function tradesRefreshTick() {
+        if (isTradesRefreshTicking) { scheduleTradesRefreshTick(); return; }
+        isTradesRefreshTicking = true;
+        try {
+          await loadTrades();
+        } catch (e) {
+          console.error(e);
+        } finally {
+          isTradesRefreshTicking = false;
+          scheduleTradesRefreshTick();
+        }
+      }
+      scheduleTradesRefreshTick();
 
       // PnL refresh every 60 seconds
       setInterval(() => { loadPnl(); }, 60000);

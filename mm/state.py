@@ -122,6 +122,16 @@ class StateStore:
                 );
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS assets_map (
+                    token_id TEXT PRIMARY KEY,
+                    market_id TEXT,
+                    market_name TEXT,
+                    outcome TEXT
+                );
+                """
+            )
 
     # Prometheus
     def _start_metrics(self, port: int) -> None:
@@ -141,7 +151,7 @@ class StateStore:
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT OR REPLACE INTO orders(order_id, token_id, side, price, size, ts) VALUES (?, ?, ?, ?, ?, ?)",
-                (rec.order_id, rec.token_id, rec.side, rec.price, rec.size, rec.timestamp),
+                (rec.order_id, rec.token_id, rec.side, rec.price, rec.timestamp, rec.size),
             )
         self.orders_total.labels(side=rec.side).inc()
 
@@ -155,6 +165,13 @@ class StateStore:
             self.fills_total.labels(side=side).inc()
         except Exception:
             pass
+
+    def upsert_asset_mapping(self, token_id: str, market_id: str | None, market_name: str | None, outcome: str | None) -> None:
+        with self._lock, self._conn:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO assets_map(token_id, market_id, market_name, outcome) VALUES (?, ?, ?, ?)",
+                (str(token_id), (market_id or None), (market_name or None), (outcome or None)),
+            )
 
     def upsert_position(self, token_id: str, yes_qty: float, no_qty: float, delta_usd: float, avg_px: float) -> None:
         with self._lock, self._conn:
@@ -235,4 +252,3 @@ class StateStore:
             cur = self._conn.execute("SELECT last_insert_rowid()")
             version = int(cur.fetchone()[0])
         return version, ts
-
