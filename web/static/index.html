@@ -339,6 +339,9 @@
         }
       }, 5000);
 
+      // Trades refresh every 5 seconds (independent of rotation)
+      setInterval(() => { loadTrades(); }, 5000);
+
       // PnL refresh every 60 seconds
       setInterval(() => { loadPnl(); }, 60000);
 

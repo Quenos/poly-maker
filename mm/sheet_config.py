@@ -51,6 +51,22 @@ class MMConfig:
     requote_queue_levels: int = 2
     order_max_age_sec: int = 12
     daily_loss_limit_pct: float = 1.0
+    # Strategy mode feature flag
+    strategy_mode: str = "avellaneda_lite"  # or "legacy"
+    # Risk budget for inventory normalization and sizing
+    risk_budget_usd: float = 1000.0
+    # Shock filter and quote aging
+    shock_ticks: int = 3
+    shock_window_ms: int = 300
+    freeze_seconds: int = 3
+    quote_max_age_ms: int = 250
+    # Queue-aware and participation caps
+    q_share_max: float = 0.3
+    participation_cap: float = 0.5
+    # Auto-backoff
+    backoff_delta_mult: float = 1.25
+    backoff_size_cut: float = 0.3
+    backoff_decay_seconds: int = 600
     # Non-retryable error backoff
     nonretryable_cooldown_sec: int = 60
     # Merger settings
@@ -249,6 +265,21 @@ def load_config() -> MMConfig:
         requote_mid_ticks=_get_int("REQUOTE_MID_TICKS", 1, sheet_settings),
         requote_queue_levels=_get_int("REQUOTE_QUEUE_LEVELS", 2, sheet_settings),
         order_max_age_sec=_get_int("ORDER_MAX_AGE_SEC", 12, sheet_settings),
+        # Strategy mode and risk budget
+        strategy_mode=_get_string("STRATEGY_MODE", "avellaneda_lite", sheet_settings),
+        risk_budget_usd=_get_float("RISK_BUDGET_USD", 1000.0, sheet_settings),
+        # Shock filter and quote aging
+        shock_ticks=_get_int("SHOCK_TICKS", 3, sheet_settings),
+        shock_window_ms=_get_int("SHOCK_WINDOW_MS", 300, sheet_settings),
+        freeze_seconds=_get_int("FREEZE_SECONDS", 3, sheet_settings),
+        quote_max_age_ms=_get_int("QUOTE_MAX_AGE_MS", 250, sheet_settings),
+        # Queue-aware and participation caps
+        q_share_max=_get_float("Q_SHARE_MAX", 0.3, sheet_settings),
+        participation_cap=_get_float("PARTICIPATION_CAP", 0.5, sheet_settings),
+        # Auto-backoff
+        backoff_delta_mult=_get_float("BACKOFF_DELTA_MULT", 1.25, sheet_settings),
+        backoff_size_cut=_get_float("BACKOFF_SIZE_CUT", 0.3, sheet_settings),
+        backoff_decay_seconds=_get_int("BACKOFF_DECAY_SECONDS", 600, sheet_settings),
         # Merger
         merge_scan_interval_sec=_get_int("MERGE_SCAN_INTERVAL_SEC", 120, sheet_settings),
         min_merge_usdc=_get_float("MIN_MERGE_USDC", 0.10, sheet_settings),

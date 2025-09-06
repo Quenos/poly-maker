@@ -16,6 +16,7 @@ from mm.orders import OrdersClient, OrdersEngine, DesiredQuote, Side, SyncAction
 from mm.orders import NonRetryableOrderError
 from mm.state import StateStore
 from mm.strategy import AvellanedaLite
+from mm.metrics import shock_freezes_total, quote_expired_cancels_total, queue_cap_events_total, participation_halts_total, backoff_active_gauge
 from mm.risk import RiskManager
 from mm.selection import SelectionManager
 from mm.merge_manager import MergeManager, MergeConfig
@@ -413,6 +414,10 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
     overcap_cancel_until: Dict[str, float] = {}
     _last_heartbeat: float = 0.0
     backfill_last_at: Dict[str, float] = {}
+    # Shock filter state and backoff
+    mid_window: Dict[str, list[tuple[float, float]]] = {}
+    freeze_until: Dict[str, float] = {}
+    backoff_state: Dict[str, dict] = {}
 
     def _compute_mid(best_bid: float | None, best_ask: float | None, tick: float = 0.01) -> float | None:
         if best_bid is None and best_ask is None:
@@ -732,6 +737,51 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                     if until is not None and now_ts < until:
                         logger.debug("Cooldown active for token %s for %.1fs", tok, until - now_ts)
                         return
+                    # Global per-order minimum notional in USD
+                    try:
+                        min_order_usd = float(getattr(cfg, "min_order_usd", 5.0))
+                    except Exception:
+                        min_order_usd = 5.0
+                    # Shock filter: detect N-tick move within M ms and freeze for T seconds
+                    try:
+                        t_ms = float(getattr(cfg, "shock_window_ms", 300))
+                        n_ticks = int(getattr(cfg, "shock_ticks", 3))
+                        freeze_sec = float(getattr(cfg, "freeze_seconds", 3))
+                        now_wall = time.time()
+                        arr = mid_window.setdefault(tok, [])
+                        arr.append((now_wall, float(fair_mid_val)))
+                        cutoff = now_wall - (t_ms / 1000.0)
+                        mid_window[tok] = [(ts0, m0) for ts0, m0 in arr if ts0 >= cutoff]
+                        fu = freeze_until.get(tok)
+                        if fu is not None and now_ts < fu:
+                            logger.debug("Freeze active for %s for %.2fs", tok, fu - now_ts)
+                            return
+                        if len(mid_window[tok]) >= 2:
+                            first_ts, first_mid = mid_window[tok][0]
+                            jump_ticks = abs(float(fair_mid_val) - float(first_mid)) / max(float(getattr(cfg, "price_tick", 0.01)), 1e-6)
+                            if jump_ticks >= n_ticks:
+                                freeze_until[tok] = now_ts + freeze_sec
+                                try:
+                                    shock_freezes_total.labels(token_id=tok).inc()
+                                except Exception:
+                                    pass
+                                logger.info("Shock filter triggered for %s: jump_ticks=%.1f freeze=%.1fs", tok, jump_ticks, freeze_sec)
+                                return
+                    except Exception:
+                        pass
+                    # Quote aging: if last quote older than threshold, cancel all for token
+                    try:
+                        max_age_ms = int(getattr(cfg, "quote_max_age_ms", 250))
+                        last_ts2 = last_quote_ts.get(tok)
+                        if last_ts2 is not None and (time.time() - last_ts2) * 1000.0 >= max_age_ms:
+                            try:
+                                orders.cancel_market_orders(asset_id=tok, reason="quote_aging")  # type: ignore[attr-defined]
+                                quote_expired_cancels_total.labels(token_id=tok).inc()
+                                logger.info("Quote aging: cancelled orders for %s (age_ms>=%.0f)", tok, float(max_age_ms))
+                            except Exception:
+                                logger.warning("Quote aging cancel failed for %s", tok)
+                    except Exception:
+                        pass
                     bookx = md.books.get(tok)
                     if not bookx:
                         logger.debug("No orderbook for token=%s (market=%s)", tok, cid)
@@ -770,10 +820,31 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                         tick=float(getattr(cfg, "price_tick", 0.01)),
                     )
                     strategies[tok] = strat
-                    # Drive strategy sigma/microprice off the token's own orderbook
-                    quote = strat.compute_quote(bookx, inventory_norm, fair_hint=fair_mid_val, token_id=tok)
+                    # Drive strategy sigma/microprice off token1 orderbook consistently
+                    quote = strat.compute_quote(book1, inventory_norm, fair_hint=fair_mid_val, token_id=tok)
                     if quote is None:
                         return
+                    # Auto-backoff handling and decay
+                    try:
+                        st = backoff_state.setdefault(tok, {"delta_mult": 1.0, "size_cut": 0.0, "requote_bump": 0, "last_hit": 0.0})
+                        now_mono = time.monotonic()
+                        decay_s = float(getattr(cfg, "backoff_decay_seconds", 600))
+                        if st["last_hit"] > 0.0 and now_mono - st["last_hit"] > decay_s:
+                            st["delta_mult"] = 1.0
+                            st["size_cut"] = 0.0
+                            st["requote_bump"] = 0
+                            st["last_hit"] = 0.0
+                        if getattr(quote, "sigma_clipped", False) or getattr(quote, "delta_clipped", False):
+                            st["delta_mult"] = max(st["delta_mult"], float(getattr(cfg, "backoff_delta_mult", 1.25)))
+                            st["size_cut"] = max(st["size_cut"], float(getattr(cfg, "backoff_size_cut", 0.3)))
+                            st["requote_bump"] = max(st["requote_bump"], 1)
+                            st["last_hit"] = now_mono
+                        try:
+                            backoff_active_gauge.labels(token_id=tok).set(1.0 if (st["delta_mult"] > 1.0 or st["size_cut"] > 0.0 or st["requote_bump"] > 0) else 0.0)
+                        except Exception:
+                            pass
+                    except Exception:
+                        st = {"delta_mult": 1.0, "size_cut": 0.0, "requote_bump": 0}
                     # Apply risk multipliers to pricing (spread and reservation price) before layering
                     from mm.strategy import StrategyState
                     adj = risk.apply(
@@ -797,7 +868,7 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                             float(fair_mid_val), float(center0), float(delta_r0), float(h0), float(getattr(adj, "gamma_multiplier", 1.0)), float(getattr(adj, "h_multiplier", 1.0))
                         )
                         delta_r1 = delta_r0 * float(adj.gamma_multiplier)
-                        h1 = h0 * float(adj.h_multiplier)
+                        h1 = h0 * float(adj.h_multiplier) * float(st.get("delta_mult", 1.0))
                         new_bid = max(0.01, min(0.99, float(fair_mid_val) + delta_r1 - h1))
                         new_ask = max(0.01, min(0.99, float(fair_mid_val) + delta_r1 + h1))
                         logger.debug(
@@ -819,6 +890,11 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                         K_total = float(getattr(cfg, "per_reprice_usdc", getattr(cfg, "base_size_usd", 300.0)))
                     except Exception:
                         K_total = 300.0
+                    # Backoff size reduction
+                    try:
+                        K_total = K_total * max(0.0, 1.0 - float(st.get("size_cut", 0.0)))
+                    except Exception:
+                        pass
                     K_yes = 0.5 * K_total * (1.0 - I_norm)
                     K_no = 0.5 * K_total * (1.0 + I_norm)
                     taper = [0.40, 0.30, 0.20, 0.10]
@@ -847,15 +923,11 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                             no_prices.append(p)
                             tsize_no.append(shares * p)  # keep USD size for engine; log share calc
                     try:
-                        # Log mirrored NO prices (1-YES) and include SELL-YES ladder separately
-                        prices_yes_dbg = [round(x, 4) for x in yes_prices]
-                        prices_no_mirror_dbg = [max(0.01, min(0.99, round(1.0 - x, 4))) for x in yes_prices]
                         logger.debug(
                             "sizing_inputs: risk_budget=%.2f inv_usd=%.2f inv_norm=%.4f K_total=%.2f K_yes=%.2f K_no=%.2f prices_yes=%s prices_no=%s",
                             float(risk_budget), float(inventory_usd), float(I_norm), float(K_total), float(K_yes), float(K_no),
-                            prices_yes_dbg, prices_no_mirror_dbg
+                            [round(x, 4) for x in yes_prices], [round(x, 4) for x in no_prices]
                         )
-                        logger.debug("sizing_inputs_sell_yes: sell_yes_prices=%s", [round(x, 4) for x in no_prices])
                     except Exception:
                         pass
                     api_bid = bookx.best_bid()
@@ -933,11 +1005,7 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                                     logger.debug("No BUY capacity for %s; cancel throttle active", tok)
                             except Exception:
                                 logger.warning("Failed to cancel open orders for %s when capacity is 0", tok)
-                        # Minimum per-order notional in USD (exchange enforces >= 5)
-                        try:
-                            min_order_usd = float(getattr(cfg, "min_order_usd", 5.0))
-                        except Exception:
-                            min_order_usd = 5.0
+                        # Minimum per-order notional in USD already computed above
                         # Parity bounds using opposite token bests (if available)
                         try:
                             other_tok = None
@@ -1012,6 +1080,20 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                                         "Capping BUY due to remaining capacity: token=%s price=%.4f orig_shares=%.2f cap_shares=%.2f",
                                         tok, float(bp_eff), float(intended_shares), float(place_shares)
                                     )
+                                # Queue-aware cap on top-of-book
+                                try:
+                                    q_share_max = float(getattr(cfg, "q_share_max", 0.3))
+                                    if idx == 0 and getattr(bookx, "bids", None) and bookx.bids:
+                                        top_sz = float(bookx.bids[0].size)
+                                        cap_usd = float(q_share_max) * top_sz * float(bp_eff)
+                                        if desired_sz > cap_usd and cap_usd >= float(min_order_usd):
+                                            try:
+                                                queue_cap_events_total.labels(token_id=tok, side="BUY").inc()
+                                            except Exception:
+                                                pass
+                                            desired_sz = cap_usd
+                                except Exception:
+                                    pass
                                 desired_quotes.append(DesiredQuote(token_id=tok, side=Side.BUY, price=float(bp_eff), size=float(desired_sz), level=idx))
                                 shares_budget -= place_shares
                                 try:
@@ -1098,6 +1180,20 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                                 continue
                             if desired_usd <= 0.0:
                                 continue
+                            # Queue-aware cap on top-of-book for asks
+                            try:
+                                q_share_max = float(getattr(cfg, "q_share_max", 0.3))
+                                if idx == 0 and getattr(bookx, "asks", None) and bookx.asks:
+                                    top_sz = float(bookx.asks[0].size)
+                                    cap_usd = float(q_share_max) * top_sz * float(ap_eff)
+                                    if desired_usd > cap_usd and cap_usd >= float(min_order_usd):
+                                        try:
+                                            queue_cap_events_total.labels(token_id=tok, side="SELL").inc()
+                                        except Exception:
+                                            pass
+                                        desired_usd = cap_usd
+                            except Exception:
+                                pass
                             desired_quotes.append(DesiredQuote(token_id=tok, side=Side.SELL, price=float(ap_eff), size=float(desired_usd), level=idx))
                             sell_shares_budget -= place_shares
                             try:
@@ -1151,6 +1247,28 @@ async def main_async(test_mode: bool = False, debug_logging: bool = False) -> No
                         # Rate-limited summary: only log if last heartbeat passed threshold
                         if (time.monotonic() - _last_heartbeat) >= float(getattr(cfg, "heartbeat_sec", 5)):
                             logger.info("Placed quotes: BUY count=%d usd=%.2f, SELL count=%d usd=%.2f", buy_cnt, buy_usd, sell_cnt, sell_usd)
+                    # Participation cap: ensure live notional per token <= participation_cap * risk_budget_usd
+                    try:
+                        part_cap = float(getattr(cfg, "participation_cap", 0.5))
+                        risk_budget = float(getattr(cfg, "risk_budget_usd", 1000.0))
+                        max_notional = max(0.0, part_cap * risk_budget)
+                        # Sum desired notional per token side this cycle
+                        notional_by_tok: Dict[str, float] = {}
+                        for dq in desired_quotes:
+                            notional_by_tok[dq.token_id] = notional_by_tok.get(dq.token_id, 0.0) + float(dq.price) * float(dq.size)
+                        for tok_i, notional in notional_by_tok.items():
+                            if notional > max_notional:
+                                try:
+                                    participation_halts_total.labels(token_id=tok_i).inc()
+                                except Exception:
+                                    pass
+                                logger.warning("Participation cap hit for %s: notional=%.2f cap=%.2f; cancelling orders", tok_i, notional, max_notional)
+                                try:
+                                    orders.cancel_market_orders(asset_id=tok_i, reason="participation_cap")  # type: ignore[attr-defined]
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
                     errs = actions.errors
                     if errs:
                         # Log first few errors and set cooldown only for affected tokens

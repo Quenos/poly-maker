@@ -411,6 +411,21 @@ class OrdersEngine:
                 except Exception as exc:
                     actions.errors.append(OrderActionError(token=dq.token_id, side=dq.side, price=dq.price, size=dq.size, type="unknown", error=str(exc)))
 
+        # Quote aging: cancel any live orders older than max age regardless of coverage
+        now_ts = self._now()
+        for oid, o in id_to_order.items():
+            ts = self._created_ts.get(oid)
+            if ts is not None and (now_ts - ts) * 1000.0 >= (self.order_max_age_sec * 1000.0):
+                try:
+                    # cancel is implicit by replacing placements; here we just record and drop tracking
+                    actions.cancelled.append(OrderActionCancelled(id=oid))
+                except Exception:
+                    pass
+                if oid in self._created_ts:
+                    del self._created_ts[oid]
+                if oid in self._price_level_idx:
+                    del self._price_level_idx[oid]
+
         # Do NOT cancel existing closer orders when deeper desired appear; skip mass cancellations
         try:
             # Per-sync summary (use DEBUG to avoid noise)

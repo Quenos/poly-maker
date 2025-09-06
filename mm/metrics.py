@@ -1,21 +1,8 @@
-from prometheus_client import Counter, Gauge, Histogram
+from prometheus_client import Counter, Gauge
 
-# Gauges
-inventory_g = Gauge("mm_inventory", "Inventory shares per token", ["token_id"])  # type: ignore
-delta_usd_g = Gauge("mm_delta_usd", "Delta USD per token", ["token_id"])  # type: ignore
-unrealized_g = Gauge("mm_unrealized", "Unrealized PnL per token", ["token_id"])  # type: ignore
-spread_g = Gauge("mm_spread", "Current spread", ["token_id"])  # type: ignore
-sigma_g = Gauge("mm_sigma", "EWMA sigma", ["token_id"])  # type: ignore
-
-# Counters
-fills_c = Counter("mm_fills_total", "Total fills", ["side"])  # type: ignore
-cancels_c = Counter("mm_cancels_total", "Total cancels")  # type: ignore
-replaces_c = Counter("mm_replaces_total", "Total replaces")  # type: ignore
-seq_gaps_c = Counter("mm_seq_gaps_total", "Sequence gaps", ["token_id"])  # type: ignore
-reconnects_c = Counter("mm_ws_reconnects_total", "WS reconnects total")  # type: ignore
-
-# Histograms
-markout_h = Histogram("mm_markout", "Markout distribution", buckets=(-0.05, -0.02, -0.01, -0.005, 0.0, 0.005, 0.01, 0.02, 0.05))  # type: ignore
-
-
-
+# Only expose new counters/gauges that are not already defined elsewhere to avoid duplicate registration
+shock_freezes_total = Counter("mm_shock_freezes_total", "Shock filter freeze events", ["token_id"])  # type: ignore
+quote_expired_cancels_total = Counter("mm_quote_expired_cancels_total", "Quote aging cancels", ["token_id"])  # type: ignore
+queue_cap_events_total = Counter("mm_queue_cap_events_total", "Queue-aware size cap events", ["token_id", "side"])  # type: ignore
+participation_halts_total = Counter("mm_participation_halts_total", "Participation cap halts", ["token_id"])  # type: ignore
+backoff_active_gauge = Gauge("mm_backoff_active", "Backoff active multiplier (1=on,0=off)", ["token_id"])  # type: ignore

@@ -19,6 +19,9 @@ empty_book_nudges_total = Counter("mm_empty_book_nudges_total", "Empty book nudg
 class Quote:
     bid: float
     ask: float
+    # Telemetry flags to inform backoff logic upstream
+    sigma_clipped: bool = False
+    delta_clipped: bool = False
 
 
 class EWMA:
@@ -138,7 +141,9 @@ class AvellanedaLite:
         # Enforce tick minimum and add fee compensation
         delta_preclip = float(delta_core)
         delta = max(t, float(delta_core)) + half_fee
+        delta_was_clipped = False
         if delta != (delta_preclip + half_fee) and not clipped_sigma:
+            delta_was_clipped = True
             try:
                 if token_id:
                     delta_clip_hits_total.labels(token_id=token_id).inc()
@@ -187,7 +192,7 @@ class AvellanedaLite:
             )
         except Exception:
             pass
-        return Quote(bid=bid, ask=ask)
+        return Quote(bid=bid, ask=ask, sigma_clipped=bool(clipped_sigma), delta_clipped=bool(delta_was_clipped))
 
     @staticmethod
     def mirror_no_side(q: Quote) -> Quote:
